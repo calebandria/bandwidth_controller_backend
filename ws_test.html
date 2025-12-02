@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<body>
+    <h1>QoS Live Stats</h1>
+    <div id="stats">Connecting...</div>
+    <script>
+        let ws = new WebSocket("ws://localhost:8080/ws/stats");
+
+        ws.onmessage = function(event) {
+            let data = JSON.parse(event.data);
+            // Assuming 'Interface', 'RxBytes', and 'TxBytes' are present
+            document.getElementById("stats").innerHTML = 
+                `Interface: ${data.Interface} <br> 
+                 Received: ${data.RxBytes} bytes <br>
+                 Sent: ${data.TxBytes} bytes`;
+        };
+        ws.onclose = function() {
+            document.getElementById("stats").innerHTML = "Connection Closed.";
+        };
+        ws.onerror = function(error) {
+            document.getElementById("stats").innerHTML = "Error: " + error.message;
+        };
+    </script>
+</body>
+</html>
