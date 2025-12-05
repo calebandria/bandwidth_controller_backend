@@ -1,0 +1,275 @@
+{
+    "swagger": "2.0",
+    "info": {
+        "description": "This API manages Quality of Service (QoS) rules using Linux Traffic Control (tc).",
+        "title": "QoS Traffic Control API",
+        "contact": {},
+        "version": "1.0"
+    },
+    "host": "localhost:8080",
+    "basePath": "/",
+    "paths": {
+        "/qos/htb/global/limit": {
+            "post": {
+                "description": "Changes the rate/ceil of the HTB root class (1:1) on both LAN and WAN interfaces.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "HTB Setup"
+                ],
+                "summary": "Updates the global rate limit for the existing HTB structure.",
+                "parameters": [
+                    {
+                        "description": "Interface and Bandwidth Update",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handler.RuleUpdateRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "status: HTB global limit updated successfully",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "400": {
+                        "description": "error: Invalid request format",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "500": {
+                        "description": "error: Failed to update HTB limit",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/qos/reset": {
+            "post": {
+                "description": "Deletes the root qdisc on both the specified LAN and WAN interfaces, effectively removing all HTB or TBF rules.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Cleanup"
+                ],
+                "summary": "Removes all shaping (QDiscs) from both interfaces.",
+                "parameters": [
+                    {
+                        "description": "Interfaces to reset",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handler.SetupRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "status: Shaping successfully reset on both interfaces",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "400": {
+                        "description": "error: Invalid request format",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "500": {
+                        "description": "error: Failed to reset shaping",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/qos/setup": {
+            "post": {
+                "description": "Sets up the root HTB qdisc and class 1:1 on both LAN and WAN interfaces.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "HTB Setup"
+                ],
+                "summary": "Initializes the HTB (Hierarchical Token Bucket) structure.",
+                "parameters": [
+                    {
+                        "description": "Interface and Global Bandwidth Configuration",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handler.SetupRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "status: HTB structure successfully initialized",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "400": {
+                        "description": "error: Invalid request format",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "500": {
+                        "description": "error: Failed to set up HTB structure",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/qos/simple/limit": {
+            "post": {
+                "description": "Applies a simple Token Bucket Filter (TBF) qdisc to the root of both LAN and WAN interfaces.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Simple TBF"
+                ],
+                "summary": "Applies a simple interface-wide limit using TBF.",
+                "parameters": [
+                    {
+                        "description": "Interface and Bandwidth/Latency parameters",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handler.RuleUpdateRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "status: Simple TBF rule applied successfully",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "400": {
+                        "description": "error: Invalid request format or missing field",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "500": {
+                        "description": "error: Failed to apply TBF rule",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "definitions": {
+        "handler.RuleUpdateRequest": {
+            "type": "object",
+            "required": [
+                "lan_interface",
+                "rate_limit",
+                "wan_interface"
+            ],
+            "properties": {
+                "lan_interface": {
+                    "type": "string",
+                    "example": "eth0"
+                },
+                "latency": {
+                    "type": "string",
+                    "example": "50ms"
+                },
+                "rate_limit": {
+                    "type": "string",
+                    "example": "10mbit"
+                },
+                "wan_interface": {
+                    "type": "string",
+                    "example": "wlan1"
+                }
+            }
+        },
+        "handler.SetupRequest": {
+            "type": "object",
+            "required": [
+                "lan_interface",
+                "total_bandwidth",
+                "wan_interface"
+            ],
+            "properties": {
+                "lan_interface": {
+                    "type": "string",
+                    "example": "eth0"
+                },
+                "total_bandwidth": {
+                    "type": "string",
+                    "example": "10mbit"
+                },
+                "wan_interface": {
+                    "type": "string",
+                    "example": "wlan1"
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,189 @@
+basePath: /
+definitions:
+  handler.RuleUpdateRequest:
+    properties:
+      lan_interface:
+        example: eth0
+        type: string
+      latency:
+        example: 50ms
+        type: string
+      rate_limit:
+        example: 10mbit
+        type: string
+      wan_interface:
+        example: wlan1
+        type: string
+    required:
+    - lan_interface
+    - rate_limit
+    - wan_interface
+    type: object
+  handler.SetupRequest:
+    properties:
+      lan_interface:
+        example: eth0
+        type: string
+      total_bandwidth:
+        example: 10mbit
+        type: string
+      wan_interface:
+        example: wlan1
+        type: string
+    required:
+    - lan_interface
+    - total_bandwidth
+    - wan_interface
+    type: object
+host: localhost:8080
+info:
+  contact: {}
+  description: This API manages Quality of Service (QoS) rules using Linux Traffic
+    Control (tc).
+  title: QoS Traffic Control API
+  version: "1.0"
+paths:
+  /qos/htb/global/limit:
+    post:
+      consumes:
+      - application/json
+      description: Changes the rate/ceil of the HTB root class (1:1) on both LAN and
+        WAN interfaces.
+      parameters:
+      - description: Interface and Bandwidth Update
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/handler.RuleUpdateRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: 'status: HTB global limit updated successfully'
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: 'error: Invalid request format'
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "500":
+          description: 'error: Failed to update HTB limit'
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Updates the global rate limit for the existing HTB structure.
+      tags:
+      - HTB Setup
+  /qos/reset:
+    post:
+      consumes:
+      - application/json
+      description: Deletes the root qdisc on both the specified LAN and WAN interfaces,
+        effectively removing all HTB or TBF rules.
+      parameters:
+      - description: Interfaces to reset
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/handler.SetupRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: 'status: Shaping successfully reset on both interfaces'
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: 'error: Invalid request format'
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "500":
+          description: 'error: Failed to reset shaping'
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Removes all shaping (QDiscs) from both interfaces.
+      tags:
+      - Cleanup
+  /qos/setup:
+    post:
+      consumes:
+      - application/json
+      description: Sets up the root HTB qdisc and class 1:1 on both LAN and WAN interfaces.
+      parameters:
+      - description: Interface and Global Bandwidth Configuration
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/handler.SetupRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: 'status: HTB structure successfully initialized'
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: 'error: Invalid request format'
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "500":
+          description: 'error: Failed to set up HTB structure'
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Initializes the HTB (Hierarchical Token Bucket) structure.
+      tags:
+      - HTB Setup
+  /qos/simple/limit:
+    post:
+      consumes:
+      - application/json
+      description: Applies a simple Token Bucket Filter (TBF) qdisc to the root of
+        both LAN and WAN interfaces.
+      parameters:
+      - description: Interface and Bandwidth/Latency parameters
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/handler.RuleUpdateRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: 'status: Simple TBF rule applied successfully'
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: 'error: Invalid request format or missing field'
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "500":
+          description: 'error: Failed to apply TBF rule'
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Applies a simple interface-wide limit using TBF.
+      tags:
+      - Simple TBF
+swagger: "2.0"
