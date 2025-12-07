@@ -1,12 +1,14 @@
 package system
 
 import (
-    "context"
-    "fmt"
-    "log"
-    "os/exec"
-    "bandwidth_controller_backend/internal/core/domain"
-    "bandwidth_controller_backend/internal/core/port"
+	"bandwidth_controller_backend/internal/core/domain"
+	"bandwidth_controller_backend/internal/core/port"
+	"context"
+	"fmt"
+	"log"
+	"os/exec"
+	"regexp"
+	"strings"
 )
 
 type LinuxDriver struct{}
@@ -28,6 +30,16 @@ func applyTcCommand(ctx context.Context, args []string, iface string) error {
     
     return nil
 }
+
+func ExecCommand(ctx context.Context, name string, arg ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, name, arg...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(output), fmt.Errorf("error executing command: %s, output: %s", err, string(output))
+	}
+	return string(output), nil
+}
+
 
 func (l *LinuxDriver) ApplyShaping(ctx context.Context, rule domain.QoSRule) error {
     _ = l.ResetShaping(ctx, rule.LanInterface, rule.WanInterface)
@@ -149,3 +161,34 @@ func (l *LinuxDriver) ResetShaping(ctx context.Context, ilan string, iwan string
     
     return firstErr
 }
+
+func (l *LinuxDriver) GetConnectedLANIPs(ctx context.Context, ilan string) ([]string, error) {
+	output, err := ExecCommand(ctx, "ip", "neighbor", "show", "dev", ilan)
+	if err != nil {
+		log.Printf("ip neighbor command failed for %s: %v, output: %s", ilan, err, output)
+		return nil, fmt.Errorf("impossible de lire la table ARP pour %s: %w", ilan, err)
+	}
+
+	var ips []string
+	ipRegex := regexp.MustCompile(`(\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b)|(\b[0-9a-fA-F:]+\b)`)
+
+	lines := strings.SplitSeq(output, "\n")
+	
+	for line := range lines {
+		trimmedLine := strings.TrimSpace(line)
+		
+		if strings.Contains(trimmedLine, "REACHABLE") || strings.Contains(trimmedLine, "STALE") || strings.Contains(trimmedLine, "DELAY") {
+			matches := ipRegex.FindAllString(trimmedLine, -1)
+			
+			for _, match := range matches {
+				if !strings.HasPrefix(match, "fe80:") {
+					ips = append(ips, match)
+					break 
+				}
+			}
+		}
+	}
+
+	return ips, nil
+}
+

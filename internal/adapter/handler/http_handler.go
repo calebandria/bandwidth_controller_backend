@@ -2,7 +2,6 @@ package handler
 
 import (
 	"net/http"
-
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 
@@ -14,36 +13,42 @@ import (
 
 type RuleUpdateRequest struct {
 	LanInterface string `json:"lan_interface" binding:"required" example:"eth0"`
-	WanInterface string `json:"wan_interface" binding:"required" example:"wlan1"` 
+	WanInterface string `json:"wan_interface" binding:"required" example:"wlan1"`
 	RateLimit    string `json:"rate_limit" binding:"required" example:"10mbit"`
 	Latency      string `json:"latency" example:"50ms"`
 }
 
 type SetupRequest struct {
-	LanInterface string `json:"lan_interface" binding:"required" example:"eth0"`
+	LanInterface   string `json:"lan_interface" binding:"required" example:"eth0"`
 	WanInterface   string `json:"wan_interface" binding:"required" example:"wlan1"`
 	TotalBandwidth string `json:"total_bandwidth" binding:"required" example:"10mbit"`
 }
 
 type ResetRequest struct {
 	LanInterface string `json:"lan_interface" binding:"required" example:"eth0"`
-	WanInterface   string `json:"wan_interface" binding:"required" example:"wlan1"`
+	WanInterface string `json:"wan_interface" binding:"required" example:"wlan1"`
 }
-
 
 type NetworkHandler struct {
 	svc      port.QoSService
 	upgrader websocket.Upgrader
+	lanInterface string
 }
 
-func NewNetworkHandler(svc port.QoSService) *NetworkHandler {
+type LanInterfaceRequest struct {
+    LanInterface string `json:"lan_interface" form:"lan_interface" binding:"required" example:"eth0"`
+}
+
+func NewNetworkHandler(svc port.QoSService, iface string) *NetworkHandler {
 	return &NetworkHandler{
 		svc: svc,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
+		lanInterface: iface,
 	}
 }
+
 
 // --- Handlers ---
 
@@ -65,7 +70,7 @@ func (h *NetworkHandler) SetupGlobalHandler(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format: " + err.Error()})
 		return
 	}
-	
+
 	if err := h.svc.SetupGlobalQoS(c.Request.Context(), req.LanInterface, req.WanInterface, req.TotalBandwidth); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to set up HTB structure: " + err.Error()})
 		return
@@ -94,7 +99,7 @@ func (h *NetworkHandler) UpdateHTBGlobalLimit(c *gin.Context) {
 
 	rule := domain.QoSRule{
 		LanInterface: req.LanInterface,
-		WanInterface: req.WanInterface, 
+		WanInterface: req.WanInterface,
 		Bandwidth:    req.RateLimit,
 		Latency:      req.Latency,
 		Enabled:      true,
@@ -134,7 +139,6 @@ func (h *NetworkHandler) UpdateSimpleLimit(c *gin.Context) {
 		Enabled:      true,
 	}
 
-
 	if err := h.svc.SetSimpleGlobalLimit(c.Request.Context(), rule); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to apply TBF rule: " + err.Error()})
 		return
@@ -155,16 +159,42 @@ func (h *NetworkHandler) UpdateSimpleLimit(c *gin.Context) {
 // @Failure 500 {object} map[string]string "error: Failed to reset shaping"
 // @Router /qos/reset [post]
 func (h *NetworkHandler) ResetShapingHandler(c *gin.Context) {
-    var req ResetRequest 
-    
-    if err := c.ShouldBindJSON(&req); err != nil {
-        c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format, need lan_interface and wan_interface: " + err.Error()})
-        return
-    }
+	var req ResetRequest
 
-    if err := h.svc.ResetQoS(c.Request.Context(), req.LanInterface, req.WanInterface); err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reset shaping: " + err.Error()})
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format, need lan_interface and wan_interface: " + err.Error()})
+		return
+	}
+
+	if err := h.svc.ResetQoS(c.Request.Context(), req.LanInterface, req.WanInterface); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reset shaping: " + err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "Shaping successfully reset on both interfaces"})
+}
+
+// GetConnectedLANIPsHandler
+// @Summary Retrieves connected client IPs on the LAN interface.
+// @Description Uses 'ip neighbor show' to find IPs in REACHABLE, STALE, or DELAY state on the local network interface.
+// @Tags Status
+// @Produce json
+// @Param lan_interface query string true "The LAN interface name (e.g., eth0)"
+// @Success 200 {array} string "List of connected IPv4 or IPv6 (non-fe80) addresses"
+// @Failure 400 {object} map[string]string "error: Missing or invalid lan_interface parameter"
+// @Failure 500 {object} map[string]string "error: Failed to execute ip neighbor command"
+// @Router /status/lanips [get]
+func (h *NetworkHandler) GetConnectedLANIPsHandler(c *gin.Context) {
+    lanInterface := h.lanInterface
+
+    if lanInterface == "" {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Missing required query parameter: lan_interface"})
         return
     }
-    c.JSON(http.StatusOK, gin.H{"status": "Shaping successfully reset on both interfaces"})
+    ips, err := h.svc.GetConnectedLANIPs(c.Request.Context(),lanInterface)
+
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve connected IPs: " + err.Error()})
+        return
+    }
+    c.JSON(http.StatusOK, gin.H{"connected_ips": ips, "interface": lanInterface})
 }

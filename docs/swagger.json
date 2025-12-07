@@ -220,6 +220,56 @@
                     }
                 }
             }
+        },
+        "/status/lanips": {
+            "get": {
+                "description": "Uses 'ip neighbor show' to find IPs in REACHABLE, STALE, or DELAY state on the local network interface.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Status"
+                ],
+                "summary": "Retrieves connected client IPs on the LAN interface.",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "The LAN interface name (e.g., eth0)",
+                        "name": "lan_interface",
+                        "in": "query",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "List of connected IPv4 or IPv6 (non-fe80) addresses",
+                        "schema": {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "400": {
+                        "description": "error: Missing or invalid lan_interface parameter",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "500": {
+                        "description": "error: Failed to execute ip neighbor command",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
         }
     },
     "definitions": {

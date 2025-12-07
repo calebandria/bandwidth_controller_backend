@@ -10,13 +10,6 @@ type QoSRule struct {
 	Enabled      bool
 }
 
-type NetStat struct {
-	Interface string
-	BytesSent uint64
-	BytesRecv uint64
-	Timestamp time.Time
-}
-
 type TrafficStat struct {
 	Interface string
 	RxBytes   uint64 

@@ -10,6 +10,7 @@ type NetworkDriver interface {
     SetupHTBStructure(ctx context.Context, ilan string, iwan string, totalBandwidth string) error
     ApplyGlobalShaping(ctx context.Context, rule domain.QoSRule) error 
     ResetShaping(ctx context.Context, ilan string, iwan string) error
+    GetConnectedLANIPs(ctx context.Context, ilan string) ([]string, error)
 }
 
 type QoSService interface {
@@ -17,4 +18,5 @@ type QoSService interface {
     SetupGlobalQoS(ctx context.Context, ilan string, iwan string, maxRate string) error
     UpdateGlobalLimit(ctx context.Context, rule domain.QoSRule) error
     ResetQoS(ctx context.Context, ilan string, iwan string) error
+    GetConnectedLANIPs(ctx context.Context, ilan string)([]string, error)
 }

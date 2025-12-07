@@ -55,7 +55,12 @@ func (s *QoSManager) SetSimpleGlobalLimit(ctx context.Context, rule domain.QoSRu
 	s.activeMode = ModeGlobalTBF
 	return s.driver.ApplyShaping(ctx, rule)
 }
+
 func (s *QoSManager) ResetQoS(ctx context.Context, ilan string, inet string,) error {
 	return s.driver.ResetShaping(ctx, ilan, inet);
+}
+
+func (s *QoSManager) GetConnectedLANIPs(ctx context.Context, ilan string)([]string, error){
+	return s.driver.GetConnectedLANIPs(ctx, ilan);
 }
 
