@@ -1,25 +1,128 @@
 <!DOCTYPE html>
-<html>
-<body>
-    <h1>QoS Live Stats</h1>
-    <div id="stats">Connecting...</div>
-    <script>
-        let ws = new WebSocket("ws://localhost:8080/ws/stats");
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QoS Traffic Monitor (WebSocket)</title>
+    <!-- Chargement de Tailwind CSS pour le style -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Configuration de la police Inter par défaut */
+        :root {
+            font-family: 'Inter', sans-serif;
+        }
+        /* Style des indicateurs de statut */
+        .status-indicator {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 8px;
+        }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen p-4 sm:p-8">
 
-        ws.onmessage = function(event) {
-            let data = JSON.parse(event.data);
-            // Assuming 'Interface', 'RxBytes', and 'TxBytes' are present
-            document.getElementById("stats").innerHTML = 
-                `Interface: ${data.Interface} <br> 
-                 Received: ${data.RxBytes} bytes <br>
-                 Sent: ${data.TxBytes} bytes`;
-        };
-        ws.onclose = function() {
-            document.getElementById("stats").innerHTML = "Connection Closed.";
-        };
-        ws.onerror = function(error) {
-            document.getElementById("stats").innerHTML = "Error: " + error.message;
-        };
+    <div class="max-w-4xl mx-auto bg-white shadow-xl rounded-xl p-6 lg:p-10">
+        <header class="mb-8 border-b pb-4">
+            <h1 class="text-3xl font-bold text-gray-800">Moniteur de Trafic Réseau QoS</h1>
+            <p class="text-gray-500 mt-1">Données de débit en temps réel via WebSocket (route `/qos/stream`).</p>
+        </header>
+
+        <!-- Statut de la connexion -->
+        <div class="mb-6 flex items-center p-3 bg-gray-100 rounded-lg shadow-inner">
+            <span id="connection-status-dot" class="status-indicator bg-red-500"></span>
+            <span id="connection-status-text" class="text-sm font-medium text-gray-600">Déconnecté (Tentative de connexion...)</span>
+        </div>
+
+        <div class="space-y-8">
+            
+            <!-- LAN Interface Stats -->
+            <div class="bg-indigo-50 border-l-4 border-indigo-500 rounded-lg p-6 shadow-md">
+                <h2 class="text-xl font-semibold text-indigo-700 mb-4">Interface LAN (<span id="lan-iface">eth0</span>)</h2>
+                <div class="grid grid-cols-2 gap-4">
+                    <div class="p-3 bg-white rounded-lg shadow-sm">
+                        <p class="text-sm text-gray-500">Taux de Réception (Rx)</p>
+                        <p class="text-2xl font-bold text-indigo-900"><span id="lan-rx-rate">0.00</span> Mbps</p>
+                    </div>
+                    <div class="p-3 bg-white rounded-lg shadow-sm">
+                        <p class="text-sm text-gray-500">Taux d'Émission (Tx)</p>
+                        <p class="text-2xl font-bold text-indigo-900"><span id="lan-tx-rate">0.00</span> Mbps</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <footer class="mt-10 pt-6 border-t text-center text-sm text-gray-400">
+            Assurez-vous que votre serveur Go est en cours d'exécution sur localhost:8080.
+        </footer>
+    </div>
+
+    <script>
+        // Définition de l'URL WebSocket
+        // NOTE: L'adresse par défaut pour les serveurs Gin est généralement ws://localhost:8080
+        const WS_URL = "ws://localhost:8080/qos/stream";
+
+        const statusDot = document.getElementById('connection-status-dot');
+        const statusText = document.getElementById('connection-status-text');
+
+        function setStatus(isConnected) {
+            if (isConnected) {
+                statusDot.classList.remove('bg-red-500', 'bg-yellow-500');
+                statusDot.classList.add('bg-green-500');
+                statusText.textContent = 'Connecté (Streaming en cours)';
+            } else {
+                statusDot.classList.remove('bg-green-500');
+                statusDot.classList.add('bg-red-500');
+                statusText.textContent = 'Déconnecté (Tentative de reconnexion dans 5s)';
+            }
+        }
+
+        function updateUI(data) {
+            // Mettre à jour les noms d'interface (si dynamiques)
+            document.getElementById('lan-iface').textContent = data.lan_stats.interface_name;
+
+            // Mettre à jour les taux de transfert (formaté à 2 décimales)
+            document.getElementById('lan-rx-rate').textContent = data.current_rate_rx_mbps.toFixed(2);
+            document.getElementById('lan-tx-rate').textContent = data.current_rate_tx_mbps.toFixed(2);
+        }
+
+        function connectWebSocket() {
+            statusDot.classList.remove('bg-red-500');
+            statusDot.classList.add('bg-yellow-500');
+            statusText.textContent = 'Tentative de connexion...';
+
+            const socket = new WebSocket(WS_URL);
+
+            socket.onopen = function() {
+                console.log("[WS] Connexion établie. Démarrage du stream.");
+                setStatus(true);
+            };
+
+            socket.onmessage = function(event) {
+                try {
+                    const data = JSON.parse(event.data);
+                    updateUI(data);
+                } catch (error) {
+                    console.error("[WS] Erreur de parsing des données:", error);
+                }
+            };
+
+            socket.onclose = function(event) {
+                console.log(`[WS] Connexion fermée. Code: ${event.code}. Raison: ${event.reason || 'N/A'}`);
+                setStatus(false);
+                // Tentative de reconnexion après un délai
+                setTimeout(connectWebSocket, 5000); 
+            };
+
+            socket.onerror = function(error) {
+                console.error("[WS] Erreur non gérée:", error);
+                // L'événement 'onclose' sera probablement déclenché après 'onerror'
+            };
+        }
+
+        // Démarrer la connexion au chargement de la page
+        document.addEventListener('DOMContentLoaded', connectWebSocket);
     </script>
 </body>
 </html>

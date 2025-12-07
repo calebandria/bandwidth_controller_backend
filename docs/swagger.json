@@ -221,6 +221,48 @@
                 }
             }
         },
+        "/qos/stats": {
+            "get": {
+                "description": "Lit les compteurs de /proc/net/dev et calcule le débit (Rx et Tx) en Mbps en utilisant l'état précédent stocké côté serveur.",
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Monitoring"
+                ],
+                "summary": "Récupère le débit de trafic par interface en une seule fois (polling HTTP).",
+                "responses": {
+                    "200": {
+                        "description": "Débit de trafic par interface",
+                        "schema": {
+                            "$ref": "#/definitions/handler.InterfaceStats"
+                        }
+                    },
+                    "400": {
+                        "description": "Requête invalide",
+                        "schema": {
+                            "type": "string"
+                        }
+                    },
+                    "500": {
+                        "description": "Erreur lors de la récupération des statistiques",
+                        "schema": {
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        },
+        "/qos/stream": {
+            "get": {
+                "description": "Met à niveau la connexion HTTP vers WebSocket et pousse les statistiques de débit toutes les 1 seconde.",
+                "tags": [
+                    "Monitoring"
+                ],
+                "summary": "Ouvre une connexion WebSocket pour streamer le débit de trafic en temps réel.",
+                "responses": {}
+            }
+        },
         "/status/lanips": {
             "get": {
                 "description": "Uses 'ip neighbor show' to find IPs in REACHABLE, STALE, or DELAY state on the local network interface.",
@@ -273,6 +315,51 @@
         }
     },
     "definitions": {
+        "handler.IPTrafficStat": {
+            "type": "object",
+            "properties": {
+                "bytes": {
+                    "type": "integer",
+                    "example": 1234567
+                },
+                "packets": {
+                    "type": "integer",
+                    "example": 1500
+                }
+            }
+        },
+        "handler.InterfaceStats": {
+            "type": "object",
+            "properties": {
+                "current_rate_rx_mbps": {
+                    "type": "number",
+                    "example": 5.5
+                },
+                "current_rate_tx_mbps": {
+                    "type": "number",
+                    "example": 12.8
+                },
+                "interface_name": {
+                    "type": "string",
+                    "example": "eth0"
+                },
+                "ip_stats": {
+                    "description": "Empty for now",
+                    "type": "object",
+                    "additionalProperties": {
+                        "$ref": "#/definitions/handler.IPTrafficStat"
+                    }
+                },
+                "total_bytes_rx": {
+                    "type": "integer",
+                    "example": 1100000
+                },
+                "total_bytes_tx": {
+                    "type": "integer",
+                    "example": 2351000
+                }
+            }
+        },
         "handler.RuleUpdateRequest": {
             "type": "object",
             "required": [

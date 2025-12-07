@@ -1,7 +1,10 @@
 package handler
 
 import (
+	"log"
 	"net/http"
+	"time"
+
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 
@@ -30,25 +33,41 @@ type ResetRequest struct {
 }
 
 type NetworkHandler struct {
-	svc      port.QoSService
-	upgrader websocket.Upgrader
+	svc          port.QoSService
+	netDriver    port.NetworkDriver
+	upgrader     websocket.Upgrader
 	lanInterface string
 }
 
 type LanInterfaceRequest struct {
-    LanInterface string `json:"lan_interface" form:"lan_interface" binding:"required" example:"eth0"`
+	LanInterface string `json:"lan_interface" form:"lan_interface" binding:"required" example:"eth0"`
 }
 
-func NewNetworkHandler(svc port.QoSService, iface string) *NetworkHandler {
+type IPTrafficStat struct {
+    Bytes uint64 `json:"bytes" example:"1234567"`
+    Packets uint64 `json:"packets" example:"1500"`
+}
+
+type InterfaceStats struct {
+	InterfaceName string `json:"interface_name" example:"eth0"`
+	CurrentRateRxMbps float64 `json:"current_rate_rx_mbps" example:"5.5"` 
+	CurrentRateTxMbps float64 `json:"current_rate_tx_mbps" example:"12.8"` 
+	TotalBytesTx  uint64 `json:"total_bytes_tx" example:"2351000"` 
+	TotalBytesRx  uint64 `json:"total_bytes_rx" example:"1100000"` 
+    
+	IPStats  map[string]IPTrafficStat `json:"ip_stats"` // Empty for now
+}
+
+func NewNetworkHandler(svc port.QoSService, netDriver port.NetworkDriver, iface string) *NetworkHandler {
 	return &NetworkHandler{
-		svc: svc,
+		svc:       svc,
+		netDriver: netDriver,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
 		lanInterface: iface,
 	}
 }
-
 
 // --- Handlers ---
 
@@ -184,17 +203,121 @@ func (h *NetworkHandler) ResetShapingHandler(c *gin.Context) {
 // @Failure 500 {object} map[string]string "error: Failed to execute ip neighbor command"
 // @Router /status/lanips [get]
 func (h *NetworkHandler) GetConnectedLANIPsHandler(c *gin.Context) {
-    lanInterface := h.lanInterface
+	lanInterface := h.lanInterface
 
-    if lanInterface == "" {
-        c.JSON(http.StatusBadRequest, gin.H{"error": "Missing required query parameter: lan_interface"})
-        return
-    }
-    ips, err := h.svc.GetConnectedLANIPs(c.Request.Context(),lanInterface)
+	if lanInterface == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing required query parameter: lan_interface"})
+		return
+	}
+	ips, err := h.svc.GetConnectedLANIPs(c.Request.Context(), lanInterface)
 
-    if err != nil {
-        c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve connected IPs: " + err.Error()})
-        return
-    }
-    c.JSON(http.StatusOK, gin.H{"connected_ips": ips, "interface": lanInterface})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve connected IPs: " + err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"connected_ips": ips, "interface": lanInterface})
 }
+
+// GetTrafficStatsHandler (Updated to use the new rate calculation logic for consistency, but still polling)
+// @Summary Récupère le débit de trafic par interface en une seule fois (polling HTTP).
+// @Description Lit les compteurs de /proc/net/dev et calcule le débit (Rx et Tx) en Mbps en utilisant l'état précédent stocké côté serveur.
+// @Tags Monitoring
+// @Produce json
+// @Success 200 {object} InterfaceStats "Débit de trafic par interface"
+// @Failure 400 {string} string "Requête invalide"
+// @Failure 500 {string} string "Erreur lors de la récupération des statistiques"
+// @Router /qos/stats [get]
+func (h *NetworkHandler) GetTrafficStatsHandler(c *gin.Context) {
+	lanInterface := h.lanInterface
+
+	if lanInterface == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing required query parameter: lan_interface"})
+		return
+	}
+
+	// Interface LAN
+	lanCurrentStats, err := h.netDriver.GetInstantaneousNetDevStats(lanInterface)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Erreur lors de la lecture des stats LAN", "details": err.Error()})
+		return
+	}
+	lanTxRate, lanRxRate, _ := h.netDriver.CalculateRateMbps(lanInterface, lanCurrentStats)
+
+	// Construction de la réponse
+	response := InterfaceStats{
+			InterfaceName:     lanInterface,
+			CurrentRateTxMbps: lanTxRate,
+			CurrentRateRxMbps: lanRxRate,
+			TotalBytesTx:      lanCurrentStats.TxBytes,
+			TotalBytesRx:      lanCurrentStats.RxBytes,
+			IPStats:           make(map[string]IPTrafficStat),
+		
+	}
+	c.JSON(http.StatusOK, response)
+}
+
+// StreamTrafficStatsHandler
+// @Summary Ouvre une connexion WebSocket pour streamer le débit de trafic en temps réel.
+// @Description Met à niveau la connexion HTTP vers WebSocket et pousse les statistiques de débit toutes les 1 seconde.
+// @Tags Monitoring
+// @Router /qos/stream [get]
+func (h *NetworkHandler) StreamTrafficStatsHandler(c *gin.Context) {
+	// Upgrade la connexion HTTP vers WebSocket
+	conn, err := h.upgrader.Upgrade(c.Writer, c.Request, nil)
+	if err != nil {
+		log.Printf("Erreur d'upgrade WebSocket: %v", err)
+		return
+	}
+	defer conn.Close()
+	
+	// Récupérer les interfaces (dans un cas réel, ces valeurs devraient être passées via la requête ou la configuration)
+	// Pour cette démo, nous utilisons des valeurs par défaut.
+	lanInterface := h.lanInterface
+
+	if lanInterface == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing required query parameter: lan_interface"})
+		return
+	}
+
+	log.Printf("Démarrage du streaming WebSocket pour %s (intervalle 1s)", lanInterface)
+
+	// Boucle de streaming en temps réel
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-c.Request.Context().Done():
+			log.Println("Client déconnecté (contexte HTTP terminé), arrêt du streaming.")
+			return
+		case <-ticker.C:
+			// 1. Lire les stats et calculer le débit
+			lanCurrentStats, errLan := h.netDriver.GetInstantaneousNetDevStats(lanInterface)
+
+			if errLan != nil {
+				log.Printf("Erreur lors de la lecture des stats: LAN=%v", errLan)
+				continue 
+			}
+
+			lanTxRate, lanRxRate, _ := h.netDriver.CalculateRateMbps(lanInterface, lanCurrentStats)
+			
+			// 2. Construire le paquet de données
+			data :=  InterfaceStats{
+					InterfaceName: lanInterface,
+					CurrentRateTxMbps: lanTxRate,
+					CurrentRateRxMbps: lanRxRate,
+					TotalBytesTx: lanCurrentStats.TxBytes,
+					TotalBytesRx: lanCurrentStats.RxBytes,
+					IPStats: make(map[string]IPTrafficStat), 
+				}
+			if err := conn.WriteJSON(data); err != nil {
+				log.Printf("Erreur d'écriture WebSocket (client déconnecté ?): %v", err)
+				return 
+			}
+
+			log.Printf("Streaming: Envoi des données (LAN Tx: %.2f Mbps)", lanTxRate)
+		}
+	}
+}
+
+

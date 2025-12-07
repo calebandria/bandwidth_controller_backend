@@ -42,7 +42,7 @@ func main() {
 
 	qosService := service.NewQoSManager(networkDriver, lanInterface, wanInterface)
 
-	qosHandler := handler.NewNetworkHandler(qosService, lanInterface)
+	qosHandler := handler.NewNetworkHandler(qosService,networkDriver, lanInterface)
 
 	log.Printf("Cleaning up interface %s and %s on startup...", wanInterface, lanInterface)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -65,6 +65,9 @@ func main() {
 	r.POST("/qos/htb/global/limit", qosHandler.UpdateHTBGlobalLimit)
 	r.POST("/qos/reset", qosHandler.ResetShapingHandler)
 	r.GET("/status/lanips", qosHandler.GetConnectedLANIPsHandler)
+	r.GET("/qos/stats", qosHandler.GetTrafficStatsHandler)
+	r.GET("/qos/stream", qosHandler.StreamTrafficStatsHandler)
+
 
 	port := "8080"
 	log.Printf("Server listening on port %s...", port)

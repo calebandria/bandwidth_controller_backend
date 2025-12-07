@@ -11,6 +11,8 @@ type NetworkDriver interface {
     ApplyGlobalShaping(ctx context.Context, rule domain.QoSRule) error 
     ResetShaping(ctx context.Context, ilan string, iwan string) error
     GetConnectedLANIPs(ctx context.Context, ilan string) ([]string, error)
+    CalculateRateMbps(ilan string,currentStats domain.NetDevStats)(txRateMbps float64, rxRateMbps float64, err error)
+    GetInstantaneousNetDevStats(iface string) (domain.NetDevStats, error)
 }
 
 type QoSService interface {

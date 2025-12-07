@@ -1,5 +1,37 @@
 basePath: /
 definitions:
+  handler.IPTrafficStat:
+    properties:
+      bytes:
+        example: 1234567
+        type: integer
+      packets:
+        example: 1500
+        type: integer
+    type: object
+  handler.InterfaceStats:
+    properties:
+      current_rate_rx_mbps:
+        example: 5.5
+        type: number
+      current_rate_tx_mbps:
+        example: 12.8
+        type: number
+      interface_name:
+        example: eth0
+        type: string
+      ip_stats:
+        additionalProperties:
+          $ref: '#/definitions/handler.IPTrafficStat'
+        description: Empty for now
+        type: object
+      total_bytes_rx:
+        example: 1100000
+        type: integer
+      total_bytes_tx:
+        example: 2351000
+        type: integer
+    type: object
   handler.RuleUpdateRequest:
     properties:
       lan_interface:
@@ -186,6 +218,38 @@ paths:
       summary: Applies a simple interface-wide limit using TBF.
       tags:
       - Simple TBF
+  /qos/stats:
+    get:
+      description: Lit les compteurs de /proc/net/dev et calcule le débit (Rx et Tx)
+        en Mbps en utilisant l'état précédent stocké côté serveur.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Débit de trafic par interface
+          schema:
+            $ref: '#/definitions/handler.InterfaceStats'
+        "400":
+          description: Requête invalide
+          schema:
+            type: string
+        "500":
+          description: Erreur lors de la récupération des statistiques
+          schema:
+            type: string
+      summary: Récupère le débit de trafic par interface en une seule fois (polling
+        HTTP).
+      tags:
+      - Monitoring
+  /qos/stream:
+    get:
+      description: Met à niveau la connexion HTTP vers WebSocket et pousse les statistiques
+        de débit toutes les 1 seconde.
+      responses: {}
+      summary: Ouvre une connexion WebSocket pour streamer le débit de trafic en temps
+        réel.
+      tags:
+      - Monitoring
   /status/lanips:
     get:
       description: Uses 'ip neighbor show' to find IPs in REACHABLE, STALE, or DELAY

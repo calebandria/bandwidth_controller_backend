@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
 type QoSRule struct {
 	LanInterface string
@@ -15,4 +18,15 @@ type TrafficStat struct {
 	RxBytes   uint64 
 	TxBytes   uint64 
 	Timestamp time.Time
+}
+
+type NetDevStats struct {
+    RxBytes uint64
+    TxBytes uint64
+}
+
+type TrafficState struct {
+    LastStats NetDevStats
+    LastTime time.Time
+    Mu sync.Mutex // To protect concurrent access
 }
