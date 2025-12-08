@@ -68,6 +68,112 @@ const docTemplate = `{
                 }
             }
         },
+        "/qos/ip/limit": {
+            "post": {
+                "description": "Adds a child class under the global HTB qdisc and applies a filter to match the specified IP address.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "HTB IP Control"
+                ],
+                "summary": "Applies a specific HTB rate limit to a client IP.",
+                "parameters": [
+                    {
+                        "description": "IP and Rate Limit Configuration",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handler.IPControlRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "status: IP rate limit applied successfully",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "400": {
+                        "description": "error: Invalid request format or missing field",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "500": {
+                        "description": "error: Failed to apply IP rate limit",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/qos/ip/remove": {
+            "post": {
+                "description": "Removes the specific child class and filter associated with the IP.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "HTB IP Control"
+                ],
+                "summary": "Removes the HTB rate limit applied to a client IP.",
+                "parameters": [
+                    {
+                        "description": "IP address to remove limit from",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/handler.IPControlRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "status: IP rate limit removed successfully",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "400": {
+                        "description": "error: Invalid request format or missing field",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    },
+                    "500": {
+                        "description": "error: Failed to remove IP rate limit",
+                        "schema": {
+                            "type": "object",
+                            "additionalProperties": {
+                                "type": "string"
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/qos/reset": {
             "post": {
                 "description": "Deletes the root qdisc on both the specified LAN and WAN interfaces, effectively removing all HTB or TBF rules.",
@@ -261,11 +367,11 @@ const docTemplate = `{
         },
         "/qos/stream": {
             "get": {
-                "description": "Met à niveau la connexion HTTP vers WebSocket et pousse les statistiques de débit toutes les 1 seconde.",
+                "description": "Met à niveau la connexion HTTP vers WebSocket et pousse les statistiques de débit par IP et globales (issues du QoSManager) toutes les ~2 secondes.",
                 "tags": [
                     "Monitoring"
                 ],
-                "summary": "Ouvre une connexion WebSocket pour streamer le débit de trafic en temps réel.",
+                "summary": "Ouvre une connexion WebSocket pour streamer le débit de trafic par IP en temps réel.",
                 "responses": {}
             }
         },
@@ -321,16 +427,50 @@ const docTemplate = `{
         }
     },
     "definitions": {
+        "handler.IPControlRequest": {
+            "type": "object",
+            "required": [
+                "ip",
+                "lan_interface",
+                "wan_interface"
+            ],
+            "properties": {
+                "ip": {
+                    "type": "string",
+                    "example": "192.168.1.10"
+                },
+                "lan_interface": {
+                    "type": "string",
+                    "example": "eth0"
+                },
+                "rate_limit": {
+                    "type": "string",
+                    "example": "5mbit"
+                },
+                "wan_interface": {
+                    "type": "string",
+                    "example": "wlan1"
+                }
+            }
+        },
         "handler.IPTrafficStat": {
             "type": "object",
             "properties": {
-                "bytes": {
-                    "type": "integer",
-                    "example": 1234567
+                "download_mbps": {
+                    "type": "number"
                 },
-                "packets": {
-                    "type": "integer",
-                    "example": 1500
+                "ip": {
+                    "type": "string"
+                },
+                "is_limited": {
+                    "type": "boolean"
+                },
+                "status": {
+                    "description": "e.g., \"Active\", \"New\", \"Disconnected\"",
+                    "type": "string"
+                },
+                "upload_mbps": {
+                    "type": "number"
                 }
             }
         },

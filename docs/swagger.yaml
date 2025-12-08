@@ -1,13 +1,37 @@
 basePath: /
 definitions:
+  handler.IPControlRequest:
+    properties:
+      ip:
+        example: 192.168.1.10
+        type: string
+      lan_interface:
+        example: eth0
+        type: string
+      rate_limit:
+        example: 5mbit
+        type: string
+      wan_interface:
+        example: wlan1
+        type: string
+    required:
+    - ip
+    - lan_interface
+    - wan_interface
+    type: object
   handler.IPTrafficStat:
     properties:
-      bytes:
-        example: 1234567
-        type: integer
-      packets:
-        example: 1500
-        type: integer
+      download_mbps:
+        type: number
+      ip:
+        type: string
+      is_limited:
+        type: boolean
+      status:
+        description: e.g., "Active", "New", "Disconnected"
+        type: string
+      upload_mbps:
+        type: number
     type: object
   handler.InterfaceStats:
     properties:
@@ -111,6 +135,78 @@ paths:
       summary: Updates the global rate limit for the existing HTB structure.
       tags:
       - HTB Setup
+  /qos/ip/limit:
+    post:
+      consumes:
+      - application/json
+      description: Adds a child class under the global HTB qdisc and applies a filter
+        to match the specified IP address.
+      parameters:
+      - description: IP and Rate Limit Configuration
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/handler.IPControlRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: 'status: IP rate limit applied successfully'
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: 'error: Invalid request format or missing field'
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "500":
+          description: 'error: Failed to apply IP rate limit'
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Applies a specific HTB rate limit to a client IP.
+      tags:
+      - HTB IP Control
+  /qos/ip/remove:
+    post:
+      consumes:
+      - application/json
+      description: Removes the specific child class and filter associated with the
+        IP.
+      parameters:
+      - description: IP address to remove limit from
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/handler.IPControlRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: 'status: IP rate limit removed successfully'
+          schema:
+            additionalProperties: true
+            type: object
+        "400":
+          description: 'error: Invalid request format or missing field'
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+        "500":
+          description: 'error: Failed to remove IP rate limit'
+          schema:
+            additionalProperties:
+              type: string
+            type: object
+      summary: Removes the HTB rate limit applied to a client IP.
+      tags:
+      - HTB IP Control
   /qos/reset:
     post:
       consumes:
@@ -244,10 +340,10 @@ paths:
   /qos/stream:
     get:
       description: Met à niveau la connexion HTTP vers WebSocket et pousse les statistiques
-        de débit toutes les 1 seconde.
+        de débit par IP et globales (issues du QoSManager) toutes les ~2 secondes.
       responses: {}
-      summary: Ouvre une connexion WebSocket pour streamer le débit de trafic en temps
-        réel.
+      summary: Ouvre une connexion WebSocket pour streamer le débit de trafic par
+        IP en temps réel.
       tags:
       - Monitoring
   /status/lanips:

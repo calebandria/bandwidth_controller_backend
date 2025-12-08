@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"fmt"
 	"log"
 	"net/http"
 	"time"
@@ -15,8 +16,6 @@ import (
 // --- Request Structs ---
 
 type RuleUpdateRequest struct {
-	LanInterface string `json:"lan_interface" binding:"required" example:"eth0"`
-	WanInterface string `json:"wan_interface" binding:"required" example:"wlan1"`
 	RateLimit    string `json:"rate_limit" binding:"required" example:"10mbit"`
 	Latency      string `json:"latency" example:"50ms"`
 }
@@ -27,26 +26,20 @@ type SetupRequest struct {
 	TotalBandwidth string `json:"total_bandwidth" binding:"required" example:"10mbit"`
 }
 
-type ResetRequest struct {
-	LanInterface string `json:"lan_interface" binding:"required" example:"eth0"`
-	WanInterface string `json:"wan_interface" binding:"required" example:"wlan1"`
-}
-
-type NetworkHandler struct {
-	svc          port.QoSService
-	netDriver    port.NetworkDriver
-	upgrader     websocket.Upgrader
-	lanInterface string
-}
-
-type LanInterfaceRequest struct {
-	LanInterface string `json:"lan_interface" form:"lan_interface" binding:"required" example:"eth0"`
+type IPControlRequest struct {
+	IP           string `json:"ip" binding:"required" example:"192.168.1.10"`
+	RateLimit    string `json:"rate_limit,omitempty" example:"5mbit"`
 }
 
 type IPTrafficStat struct {
-    Bytes uint64 `json:"bytes" example:"1234567"`
-    Packets uint64 `json:"packets" example:"1500"`
+	IP           string  `json:"ip"`
+	UploadRate   float64 `json:"upload_mbps"`
+	DownloadRate float64 `json:"download_mbps"`
+	IsLimited    bool    `json:"is_limited"`
+	Status       string  `json:"status"` // e.g., "Active", "New", "Disconnected"
+
 }
+
 
 type InterfaceStats struct {
 	InterfaceName string `json:"interface_name" example:"eth0"`
@@ -54,18 +47,28 @@ type InterfaceStats struct {
 	CurrentRateTxMbps float64 `json:"current_rate_tx_mbps" example:"12.8"` 
 	TotalBytesTx  uint64 `json:"total_bytes_tx" example:"2351000"` 
 	TotalBytesRx  uint64 `json:"total_bytes_rx" example:"1100000"` 
-    
 	IPStats  map[string]IPTrafficStat `json:"ip_stats"` // Empty for now
 }
 
-func NewNetworkHandler(svc port.QoSService, netDriver port.NetworkDriver, iface string) *NetworkHandler {
+// --- Handler Structure ---
+
+type NetworkHandler struct {
+	svc          port.QoSService
+	netDriver    port.NetworkDriver
+	upgrader     websocket.Upgrader
+	lanInterface string
+	wanInterface string
+}
+
+func NewNetworkHandler(svc port.QoSService, netDriver port.NetworkDriver, ilan string, inet string) *NetworkHandler {
 	return &NetworkHandler{
 		svc:       svc,
 		netDriver: netDriver,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
-		lanInterface: iface,
+		lanInterface: ilan,
+		wanInterface: inet,
 	}
 }
 
@@ -117,8 +120,8 @@ func (h *NetworkHandler) UpdateHTBGlobalLimit(c *gin.Context) {
 	}
 
 	rule := domain.QoSRule{
-		LanInterface: req.LanInterface,
-		WanInterface: req.WanInterface,
+		LanInterface: h.lanInterface,
+		WanInterface: h.wanInterface,
 		Bandwidth:    req.RateLimit,
 		Latency:      req.Latency,
 		Enabled:      true,
@@ -128,7 +131,72 @@ func (h *NetworkHandler) UpdateHTBGlobalLimit(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update HTB limit: " + err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"status": "HTB global limit updated successfully", "lan_interface": req.LanInterface, "wan_interface": req.WanInterface})
+	c.JSON(http.StatusOK, gin.H{"status": "HTB global limit updated successfully", "lan_interface": rule.LanInterface, "rate_limit": rule.WanInterface})
+}
+
+// AddIPRateLimitHandler
+// @Summary Applies a specific HTB rate limit to a client IP.
+// @Description Adds a child class under the global HTB qdisc and applies a filter to match the specified IP address.
+// @Tags HTB IP Control
+// @Accept json
+// @Produce json
+// @Param request body IPControlRequest true "IP and Rate Limit Configuration"
+// @Success 200 {object} map[string]interface{} "status: IP rate limit applied successfully"
+// @Failure 400 {object} map[string]string "error: Invalid request format or missing field"
+// @Failure 500 {object} map[string]string "error: Failed to apply IP rate limit"
+// @Router /qos/ip/limit [post]
+func (h *NetworkHandler) AddIPRateLimitHandler(c *gin.Context) {
+	var req IPControlRequest
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format or missing field: " + err.Error()})
+		return
+	}
+	if req.RateLimit == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Rate limit is required for applying an IP limit."})
+		return
+	}
+
+	rule := domain.QoSRule{
+		LanInterface: h.lanInterface,
+		WanInterface: h.wanInterface,
+		Bandwidth:    req.RateLimit,
+		Enabled:      true,
+	}
+
+	if err := h.svc.AddIPRateLimit(c.Request.Context(), req.IP, rule); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to apply rate limit for IP %s: %v", req.IP, err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "IP rate limit applied successfully", "ip": req.IP, "rate": req.RateLimit})
+}
+
+// RemoveIPRateLimitHandler
+// @Summary Removes the HTB rate limit applied to a client IP.
+// @Description Removes the specific child class and filter associated with the IP.
+// @Tags HTB IP Control
+// @Accept json
+// @Produce json
+// @Param request body IPControlRequest true "IP address to remove limit from"
+// @Success 200 {object} map[string]interface{} "status: IP rate limit removed successfully"
+// @Failure 400 {object} map[string]string "error: Invalid request format or missing field"
+// @Failure 500 {object} map[string]string "error: Failed to remove IP rate limit"
+// @Router /qos/ip/remove [post]
+func (h *NetworkHandler) RemoveIPRateLimitHandler(c *gin.Context) {
+	var req IPControlRequest
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format or missing field: " + err.Error()})
+		return
+	}
+
+	if err := h.svc.RemoveIPRateLimit(c.Request.Context(), req.IP); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to remove rate limit for IP %s: %v", req.IP, err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "IP rate limit removed successfully", "ip": req.IP})
 }
 
 // UpdateSimpleLimit
@@ -151,8 +219,8 @@ func (h *NetworkHandler) UpdateSimpleLimit(c *gin.Context) {
 	}
 
 	rule := domain.QoSRule{
-		LanInterface: req.LanInterface,
-		WanInterface: req.WanInterface,
+		LanInterface: h.lanInterface,
+		WanInterface: h.lanInterface,
 		Bandwidth:    req.RateLimit,
 		Latency:      req.Latency,
 		Enabled:      true,
@@ -163,7 +231,7 @@ func (h *NetworkHandler) UpdateSimpleLimit(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"status": "Simple TBF rule applied successfully", "lan_interface": req.LanInterface, "wan_interface": req.WanInterface})
+	c.JSON(http.StatusOK, gin.H{"status": "Simple TBF rule applied successfully", "lan_interface": rule.LanInterface, "wan_interface": rule.WanInterface})
 }
 
 // ResetShapingHandler
@@ -172,20 +240,13 @@ func (h *NetworkHandler) UpdateSimpleLimit(c *gin.Context) {
 // @Tags Cleanup
 // @Accept json
 // @Produce json
-// @Param request body SetupRequest true "Interfaces to reset"
 // @Success 200 {object} map[string]interface{} "status: Shaping successfully reset on both interfaces"
 // @Failure 400 {object} map[string]string "error: Invalid request format"
 // @Failure 500 {object} map[string]string "error: Failed to reset shaping"
 // @Router /qos/reset [post]
 func (h *NetworkHandler) ResetShapingHandler(c *gin.Context) {
-	var req ResetRequest
 
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format, need lan_interface and wan_interface: " + err.Error()})
-		return
-	}
-
-	if err := h.svc.ResetQoS(c.Request.Context(), req.LanInterface, req.WanInterface); err != nil {
+	if err := h.svc.ResetQoS(c.Request.Context(), h.lanInterface, h.wanInterface); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to reset shaping: " + err.Error()})
 		return
 	}
@@ -197,7 +258,6 @@ func (h *NetworkHandler) ResetShapingHandler(c *gin.Context) {
 // @Description Uses 'ip neighbor show' to find IPs in REACHABLE, STALE, or DELAY state on the local network interface.
 // @Tags Status
 // @Produce json
-// @Param lan_interface query string true "The LAN interface name (e.g., eth0)"
 // @Success 200 {array} string "List of connected IPv4 or IPv6 (non-fe80) addresses"
 // @Failure 400 {object} map[string]string "error: Missing or invalid lan_interface parameter"
 // @Failure 500 {object} map[string]string "error: Failed to execute ip neighbor command"
@@ -218,7 +278,7 @@ func (h *NetworkHandler) GetConnectedLANIPsHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"connected_ips": ips, "interface": lanInterface})
 }
 
-// GetTrafficStatsHandler (Updated to use the new rate calculation logic for consistency, but still polling)
+// GetTrafficStatsHandler (Unchanged from the user's input, still uses polling netDriver)
 // @Summary Récupère le débit de trafic par interface en une seule fois (polling HTTP).
 // @Description Lit les compteurs de /proc/net/dev et calcule le débit (Rx et Tx) en Mbps en utilisant l'état précédent stocké côté serveur.
 // @Tags Monitoring
@@ -257,8 +317,8 @@ func (h *NetworkHandler) GetTrafficStatsHandler(c *gin.Context) {
 }
 
 // StreamTrafficStatsHandler
-// @Summary Ouvre une connexion WebSocket pour streamer le débit de trafic en temps réel.
-// @Description Met à niveau la connexion HTTP vers WebSocket et pousse les statistiques de débit toutes les 1 seconde.
+// @Summary Ouvre une connexion WebSocket pour streamer le débit de trafic par IP en temps réel.
+// @Description Met à niveau la connexion HTTP vers WebSocket et pousse les statistiques de débit par IP et globales (issues du QoSManager) toutes les ~2 secondes.
 // @Tags Monitoring
 // @Router /qos/stream [get]
 func (h *NetworkHandler) StreamTrafficStatsHandler(c *gin.Context) {
@@ -269,55 +329,38 @@ func (h *NetworkHandler) StreamTrafficStatsHandler(c *gin.Context) {
 		return
 	}
 	defer conn.Close()
-	
-	// Récupérer les interfaces (dans un cas réel, ces valeurs devraient être passées via la requête ou la configuration)
-	// Pour cette démo, nous utilisons des valeurs par défaut.
-	lanInterface := h.lanInterface
 
-	if lanInterface == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing required query parameter: lan_interface"})
-		return
-	}
+	// Le service expose un canal de statistiques par IP
+	statsStream := h.svc.GetStatsStream()
 
-	log.Printf("Démarrage du streaming WebSocket pour %s (intervalle 1s)", lanInterface)
-
-	// Boucle de streaming en temps réel
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
+	log.Printf("Démarrage du streaming WebSocket via QoSManager statsStream.")
 	
 	for {
 		select {
 		case <-c.Request.Context().Done():
+			// Le client HTTP (Gin) est déconnecté/le contexte est annulé.
 			log.Println("Client déconnecté (contexte HTTP terminé), arrêt du streaming.")
 			return
-		case <-ticker.C:
-			// 1. Lire les stats et calculer le débit
-			lanCurrentStats, errLan := h.netDriver.GetInstantaneousNetDevStats(lanInterface)
-
-			if errLan != nil {
-				log.Printf("Erreur lors de la lecture des stats: LAN=%v", errLan)
-				continue 
+		case stat, ok := <-statsStream:
+			if !ok {
+				// Le canal du service a été fermé.
+				log.Println("Le canal de statistiques du QoSManager est fermé.")
+				return
 			}
-
-			lanTxRate, lanRxRate, _ := h.netDriver.CalculateRateMbps(lanInterface, lanCurrentStats)
 			
-			// 2. Construire le paquet de données
-			data :=  InterfaceStats{
-					InterfaceName: lanInterface,
-					CurrentRateTxMbps: lanTxRate,
-					CurrentRateRxMbps: lanRxRate,
-					TotalBytesTx: lanCurrentStats.TxBytes,
-					TotalBytesRx: lanCurrentStats.RxBytes,
-					IPStats: make(map[string]IPTrafficStat), 
-				}
-			if err := conn.WriteJSON(data); err != nil {
+			// Le type service.IPTrafficStat contient toutes les infos par IP.
+			// Nous pouvons l'envoyer directement.
+			// NOTE: Nous utilisons le type stat du package service pour la diffusion.
+			if err := conn.WriteJSON(stat); err != nil {
+				// Erreur d'écriture (client déconnecté, connexion rompue)
 				log.Printf("Erreur d'écriture WebSocket (client déconnecté ?): %v", err)
 				return 
 			}
 
-			log.Printf("Streaming: Envoi des données (LAN Tx: %.2f Mbps)", lanTxRate)
+			// log.Printf("Streaming: Envoi des données pour IP %s (Tx: %.2f Mbps)", stat.IP, stat.UploadRate)
+		default:
+			// Utiliser un court délai pour éviter une boucle de CPU intensive si le canal est vide
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 }
-
-
