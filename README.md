@@ -127,10 +127,10 @@ Exemple d'Utilisation avec curl
     curl -X PUT http://localhost:8080/qos/simple/limit -H "Content-Type: application/json" -d '{"rate_limit": "50mbit"}'
 
 
-### 2. Appliquer une limite simple TBF de 50Mbit/s :
+### 3. Appliquer une limite simple TBF de 50Mbit/s :
 
     curl -X POST http://localhost:8080/qos/htb/global/limit -H "Content-Type: application/json" -d '{"rate_limit": "50mbit", "latency": "50ms"}'
 
-### 3. Réinitialiser la mise en forme (Cleanup) :
+### 4. Réinitialiser la mise en forme (Cleanup) :
 
     curl -X POST http://localhost:8080/qos/reset -H "Content-Type: application/json" -d '{"lan_interface": "wlo1", "wan_interface": "eno2"}'
