@@ -122,11 +122,14 @@ Exemple d'Utilisation avec curl
 
     curl -X POST http://localhost:8080/qos/setup -H "Content-Type: application/json" -d '{"total_bandwidth": "100mbit"}'
 
-
-### 2. Appliquer une limite simple TBF de 50Mbit/s :
+### 2. Appliquer une limite HTB de 50Mbit/s :
 
     curl -X PUT http://localhost:8080/qos/simple/limit -H "Content-Type: application/json" -d '{"rate_limit": "50mbit"}'
 
+
+### 2. Appliquer une limite simple TBF de 50Mbit/s :
+
+    curl -X POST http://localhost:8080/qos/htb/global/limit -H "Content-Type: application/json" -d '{"rate_limit": "50mbit", "latency": "50ms"}'
 
 ### 3. Réinitialiser la mise en forme (Cleanup) :
 
