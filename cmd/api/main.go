@@ -56,14 +56,14 @@ func main() {
     log.Printf("Cleaning up interface %s and %s on startup...", wanInterface, lanInterface)
     
     // Contexte court pour le cleanup
-    cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+    /* cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
     defer cleanupCancel()
 
     if err := networkDriver.ResetShaping(cleanupCtx, lanInterface, wanInterface); err != nil {
         log.Printf("Warning: Could not clean up existing QoS rules (may be normal if none exist): %v", err)
     } else {
         log.Println("Interface cleaned successfully.")
-    }
+    } */
 
     // --- Configuration des Routes Gin ---
     r := gin.Default()

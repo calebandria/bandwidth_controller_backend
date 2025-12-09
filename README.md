@@ -120,12 +120,12 @@ Exemple d'Utilisation avec curl
 
 ### 1. Initialiser la structure HTB à 100Mbit/s :
 
-    curl -X POST http://localhost:8080/qos/setup -H "Content-Type: application/json" -d '{"lan_interface": "wlo1", "wan_interface": "eno2", "total_bandwidth": "100mbit"}'
+    curl -X POST http://localhost:8080/qos/setup -H "Content-Type: application/json" -d '{"total_bandwidth": "100mbit"}'
 
 
 ### 2. Appliquer une limite simple TBF de 50Mbit/s :
 
-    curl -X PUT http://localhost:8080/qos/simple/limit -H "Content-Type: application/json" -d '{"lan_interface": "wlo1", "wan_interface": "eno2", "rate_limit": "50mbit"}'
+    curl -X PUT http://localhost:8080/qos/simple/limit -H "Content-Type: application/json" -d '{"rate_limit": "50mbit"}'
 
 
 ### 3. Réinitialiser la mise en forme (Cleanup) :

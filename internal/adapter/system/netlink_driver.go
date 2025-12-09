@@ -181,43 +181,56 @@ func (l *LinuxDriver) ApplyGlobalShaping(ctx context.Context, rule domain.QoSRul
 
 // ResetShaping deletes the root qdisc on both interfaces.
 func (l *LinuxDriver) ResetShaping(ctx context.Context, ilan string, iwan string) error {
-	var firstErr error
+    var firstErr error
 
-	delQdisc := func(iface string) error {
-		cmd := exec.CommandContext(ctx, "tc", "qdisc", "del", "dev", iface, "root")
-		output, err := cmd.CombinedOutput()
+    delQdisc := func(iface string) error {
+        cmd := exec.CommandContext(ctx, "tc", "qdisc", "del", "dev", iface, "root")
+        output, err := cmd.CombinedOutput()
 
-		if err != nil {
-			outputStr := string(output)
-			// Ignore "No such file or directory" or "Invalid argument" if qdisc doesn't exist
-			if strings.Contains(outputStr, "No such file or directory") || strings.Contains(outputStr, "Invalid argument") {
-				return nil
-			}
+        if err != nil {
+            outputStr := string(output)
+            
+            // --- CRITICAL FIX START ---
+            // 1. Check for the specific error when no qdisc exists (your observed error)
+            // 2. The generic "Cannot delete specified qdisc" error is also returned when the handle is missing.
+            if strings.Contains(outputStr, "Cannot delete qdisc with handle of zero") ||
+               strings.Contains(outputStr, "Cannot delete specified qdisc") {
+                log.Printf("INFO: No root qdisc found on %s, treating as successful reset.", iface)
+                return nil // Treat "no qdisc exists" as a success (idempotency)
+            }
+            // --- CRITICAL FIX END ---
 
-			log.Printf("ERROR: Failed to reset shaping on %s. Output: %s", iface, outputStr)
-			return fmt.Errorf("failed to delete qdisc on %s: %s", iface, outputStr)
-		}
-		log.Printf("QDisc reset successful on %s.", iface)
-		return nil
-	}
+            // The previously checked (but less specific) errors:
+            if strings.Contains(outputStr, "No such file or directory") || strings.Contains(outputStr, "Invalid argument") {
+                return nil
+            }
+
+            // Log and return an actual failure
+            log.Printf("ERROR: Failed to reset shaping on %s. Output: %s", iface, outputStr)
+            return fmt.Errorf("failed to delete qdisc on %s: %s", iface, outputStr)
+        }
+        
+        log.Printf("QDisc reset successful on %s.", iface)
+        return nil
+    }
     
     // Clear local state tracking when resetting the entire QoS
     l.mu.Lock()
-    l.activeIPs = make(ActiveIPConfig)
+    l.activeIPs = make(ActiveIPConfig) // Assuming ActiveIPConfig is your map type
     l.nextClassID = 10
     l.mu.Unlock()
 
-	if err := delQdisc(ilan); err != nil {
-		firstErr = err
-	}
+    if err := delQdisc(ilan); err != nil {
+        firstErr = err
+    }
 
-	if err := delQdisc(iwan); err != nil {
-		if firstErr == nil {
-			firstErr = err
-		}
-	}
+    if err := delQdisc(iwan); err != nil {
+        if firstErr == nil {
+            firstErr = err
+        }
+    }
 
-	return firstErr
+    return firstErr
 }
 
 // GetConnectedLANIPs reads the ARP/Neighbor table.

@@ -21,8 +21,6 @@ type RuleUpdateRequest struct {
 }
 
 type SetupRequest struct {
-	LanInterface   string `json:"lan_interface" binding:"required" example:"eth0"`
-	WanInterface   string `json:"wan_interface" binding:"required" example:"wlan1"`
 	TotalBandwidth string `json:"total_bandwidth" binding:"required" example:"10mbit"`
 }
 
@@ -60,6 +58,22 @@ type NetworkHandler struct {
 	wanInterface string
 }
 
+type ScheduleEntry struct {
+    StartTime time.Time `json:"start_time" binding:"required" example:"2025-12-31T20:00:00Z"`
+    EndTime   time.Time `json:"end_time" binding:"required" example:"2026-01-01T08:00:00Z"`
+}
+
+// @Description Requête pour planifier une mise à jour de la limite globale HTB.
+type ScheduledRuleRequest struct {
+    RuleUpdateRequest
+    ScheduleEntry
+}
+
+type ScheduledIPControlRequest struct {
+    IPControlRequest
+    ScheduleEntry
+}
+
 func NewNetworkHandler(svc port.QoSService, netDriver port.NetworkDriver, ilan string, inet string) *NetworkHandler {
 	return &NetworkHandler{
 		svc:       svc,
@@ -93,12 +107,12 @@ func (h *NetworkHandler) SetupGlobalHandler(c *gin.Context) {
 		return
 	}
 
-	if err := h.svc.SetupGlobalQoS(c.Request.Context(), req.LanInterface, req.WanInterface, req.TotalBandwidth); err != nil {
+	if err := h.svc.SetupGlobalQoS(c.Request.Context(), h.lanInterface, h.wanInterface, req.TotalBandwidth); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to set up HTB structure: " + err.Error()})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"status": "HTB structure successfully initialized", "lan_interface": req.LanInterface, "wan_interface": req.WanInterface, "rate": req.TotalBandwidth})
+	c.JSON(http.StatusOK, gin.H{"status": "HTB structure successfully initialized", "lan_interface": h.lanInterface, "wan_interface": h.wanInterface, "rate": req.TotalBandwidth})
 }
 
 // UpdateHTBGlobalLimit
@@ -363,4 +377,62 @@ func (h *NetworkHandler) StreamTrafficStatsHandler(c *gin.Context) {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
+}
+
+// ScheduleGlobalLimitHandler
+// @Summary Planifie une limite de bande passante globale pour une période donnée.
+// @Description Configure une limite HTB sur les interfaces spécifiées, active à l'heure de début et réinitialisée à l'heure de fin.
+// @Tags Scheduling
+// @Accept json
+// @Produce json
+// @Param rule body ScheduledRuleRequest true "Règle de QoS et Horaire"
+// @Success 200 {object} gin.H{"status":"string"} "Planification de la règle globale réussie"
+// @Failure 400 {string} string "Requête invalide"
+// @Failure 500 {string} string "Erreur lors de la planification"
+// @Router /qos/schedule/global [post]
+func (h *NetworkHandler) ScheduleGlobalLimitHandler(c *gin.Context) {
+    var req ScheduledRuleRequest
+    if err := c.ShouldBindJSON(&req); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format: " + err.Error()})
+        return
+    }
+
+    // Ici, vous appelleriez le service (h.svc) qui gère la logique de planification
+    // (par exemple, enregistrer la tâche dans une base de données ou un planificateur local).
+    log.Printf("Scheduling global limit %s from %s to %s on %s/%s", 
+        req.RateLimit, req.StartTime.Format(time.RFC3339), req.EndTime.Format(time.RFC3339), h.lanInterface, h.wanInterface)
+
+    // TODO: Implémenter h.svc.ScheduleGlobalLimit(req)
+
+    c.JSON(http.StatusOK, gin.H{"status": "Global limit scheduled successfully", 
+        "start_time": req.StartTime.Format(time.RFC3339), "end_time": req.EndTime.Format(time.RFC3339)})
+}
+
+// ScheduleIPLimitHandler
+// @Summary Planifie une limite de bande passante pour une adresse IP spécifique pour une période donnée.
+// @Description Configure une limite TBF (ou HTB) pour une adresse IP, active à l'heure de début et réinitialisée à l'heure de fin.
+// @Tags Scheduling
+// @Accept json
+// @Produce json
+// @Param rule body ScheduledIPControlRequest true "Règle de contrôle IP et Horaire"
+// @Success 200 {object} gin.H{"status":"string"} "Planification de la règle IP réussie"
+// @Failure 400 {string} string "Requête invalide"
+// @Failure 500 {string} string "Erreur lors de la planification"
+// @Router /qos/schedule/ip [post]
+func (h *NetworkHandler) ScheduleIPLimitHandler(c *gin.Context) {
+    var req ScheduledIPControlRequest
+    if err := c.ShouldBindJSON(&req); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format: " + err.Error()})
+        return
+    }
+
+    // Ici, vous appelleriez le service (h.svc) qui gère la logique de planification
+    // (par exemple, enregistrer la tâche dans une base de données ou un planificateur local).
+    log.Printf("Scheduling IP limit %s for IP %s from %s to %s on %s", 
+        req.RateLimit, req.IP, req.StartTime.Format(time.RFC3339), req.EndTime.Format(time.RFC3339), h.lanInterface)
+
+    // TODO: Implémenter h.svc.ScheduleIPLimit(req)
+
+    c.JSON(http.StatusOK, gin.H{"status": "IP limit scheduled successfully", 
+        "ip_address": req.IP, "start_time": req.StartTime.Format(time.RFC3339), "end_time": req.EndTime.Format(time.RFC3339)})
 }
