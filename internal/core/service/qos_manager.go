@@ -44,6 +44,7 @@ type QoSManager struct {
 	ilan        string
 	inet        string
 	activeMode  string
+	globalSetupMutex sync.Mutex
 	
 	// Suivi des IPs actuellement limitées (et donc avec une classe HTB).
 	activeIPLimits map[string]IPTrackingInfo
@@ -115,6 +116,29 @@ func (s *QoSManager) AddIPRateLimit(ctx context.Context, ip string, rule domain.
 	if s.activeMode != ModeGlobalHTB {
 		return errors.New("HTB mode is not active. Cannot apply IP limits")
 	}
+
+	if !s.driver.IsHTBInitialized(ctx, rule.LanInterface, rule.WanInterface) {
+        log.Println("WARNING: Base HTB structure missing. Attempting lazy setup now.")
+        
+        // Use a dedicated setup lock to prevent multiple goroutines from running SetupGlobalQoS simultaneously.
+        // Assuming s.globalSetupMutex exists and protects SetupGlobalQoS from the outside.
+        // If not, you must create one.
+        s.globalSetupMutex.Lock() // Must lock BEFORE calling SetupGlobalQoS
+        defer s.globalSetupMutex.Unlock()
+        
+        // Re-check after acquiring the lock (in case another goroutine just finished the setup)
+        if !s.driver.IsHTBInitialized(ctx, rule.LanInterface, rule.WanInterface) {
+            setupCtx, setupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+            defer setupCancel()
+            
+            // Re-run the critical setup logic
+            if err := s.SetupGlobalQoS(setupCtx, rule.LanInterface, rule.WanInterface, rule.Bandwidth); err != nil {
+                // If it fails here, the whole system has a problem, but we let it try again later.
+                return fmt.Errorf("failed lazy setup of global HTB: %w", err)
+            }
+            log.Println("Lazy HTB setup successful. Proceeding with IP rule.")
+        }
+    }
 
 	s.ipMutex.Lock()
 	defer s.ipMutex.Unlock()

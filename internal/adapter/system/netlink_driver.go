@@ -32,6 +32,7 @@ type LinuxDriver struct {
 	activeIPs ActiveIPConfig
 	mu          sync.Mutex // Mutex for protecting activeIPs and nextClassID
 	nextClassID uint16     // Counter to assign unique class IDs starting from 10
+	isHTBReady bool
 }
 
 
@@ -39,7 +40,15 @@ func NewLinuxDriver() port.NetworkDriver {
 	return &LinuxDriver{
 		activeIPs:   make(ActiveIPConfig),
 		nextClassID: 10, // Start with 10 (1:1 is root)
+		isHTBReady: false,
 	}
+}
+
+// IsHTBInitialized implements the necessary check for QoSManager.
+func (l *LinuxDriver) IsHTBInitialized(ctx context.Context, lanInterface, wanInterface string) bool {
+    l.mu.Lock()
+    defer l.mu.Unlock()
+    return l.isHTBReady
 }
 
 // applyTcCommand executes a 'tc' command and handles errors.
@@ -152,6 +161,10 @@ func (l *LinuxDriver) SetupHTBStructure(ctx context.Context, ilan string, iwan s
 		return err
 	}
 
+	l.mu.Lock()
+    l.isHTBReady = true
+    l.mu.Unlock()
+
 	return nil
 }
 
@@ -182,6 +195,7 @@ func (l *LinuxDriver) ApplyGlobalShaping(ctx context.Context, rule domain.QoSRul
 // ResetShaping deletes the root qdisc on both interfaces.
 func (l *LinuxDriver) ResetShaping(ctx context.Context, ilan string, iwan string) error {
     var firstErr error
+
 
     delQdisc := func(iface string) error {
         cmd := exec.CommandContext(ctx, "tc", "qdisc", "del", "dev", iface, "root")
@@ -218,6 +232,7 @@ func (l *LinuxDriver) ResetShaping(ctx context.Context, ilan string, iwan string
     l.mu.Lock()
     l.activeIPs = make(ActiveIPConfig) // Assuming ActiveIPConfig is your map type
     l.nextClassID = 10
+	l.isHTBReady = false
     l.mu.Unlock()
 
     if err := delQdisc(ilan); err != nil {

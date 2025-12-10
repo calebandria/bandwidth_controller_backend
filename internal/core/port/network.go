@@ -21,6 +21,7 @@ type NetworkDriver interface {
 	GetInstantaneousNetDevStats(iface string) (domain.NetDevStats, error)
 	RemoveIPRateLimit(ctx context.Context, ip string, rule domain.QoSRule) error
 	AddIPRateLimit(ctx context.Context, ip string, rule domain.QoSRule) error
+	IsHTBInitialized(ctx context.Context, lanInterface, wanInterface string) bool
 }
 
 type QoSService interface {

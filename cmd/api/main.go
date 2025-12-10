@@ -40,15 +40,27 @@ func main() {
 
     log.Println("Starting QoS Bandwidth Controller...")
 
+
     networkDriver := system.NewLinuxDriver()
-
-    // 1. Initialiser le service QoSManager
-    qosService := service.NewQoSManager(networkDriver, lanInterface, wanInterface)
-
-    // 2. Démarrer la boucle de monitoring en temps réel (en arrière-plan)
-    // Le contexte est utilisé pour gérer l'arrêt propre de la boucle si nécessaire
     ctx, cancel := context.WithCancel(context.Background())
     defer cancel()
+
+    // Contexte court pour le cleanup
+    cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cleanupCancel()
+
+    qosService := service.NewQoSManager(networkDriver, lanInterface, wanInterface)
+
+    if err := qosService.SetupGlobalQoS(cleanupCtx, lanInterface, wanInterface, globalRateLimit); err != nil {
+        log.Fatalf("Fatal Error: Could not start default global HTB QoS: %v. Exiting.", err) 
+    } else {
+        log.Println("Automatic HTB startup success")
+        
+        // ⚠️ ADD THIS DELAY: Give the Linux kernel a moment to commit the complex TC rules.
+        log.Println("Waiting 100ms for system commit...")
+        time.Sleep(100 * time.Millisecond) 
+    }
+
     // UTILISATION DE 'go' POUR EXÉCUTER LA BOUCLE DE MONITORING EN PARALLÈLE
     go qosService.StartIPMonitoring(ctx, 2 * time.Second) // Lance le monitoring toutes les 2 secondes
 
@@ -57,22 +69,12 @@ func main() {
 
     log.Printf("Cleaning up interface %s and %s on startup...", wanInterface, lanInterface)
     
-    // Contexte court pour le cleanup
-    cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
-    defer cleanupCancel()
-
+    
     if err := networkDriver.ResetShaping(cleanupCtx, lanInterface, wanInterface); err != nil {
         log.Printf("Warning: Could not clean up existing QoS rules (may be normal if none exist): %v", err)
     } else {
         log.Println("Interface cleaned successfully.")
     }
-
-    if err := networkDriver.SetupHTBStructure(cleanupCtx, lanInterface, wanInterface, globalRateLimit); err != nil {
-        log.Printf("Warning: Could not start default global HTB QoS: %v", err)
-    } else {
-        log.Println("Automatic HTB startup success")
-    }
-
 
 
     // --- Configuration des Routes Gin ---

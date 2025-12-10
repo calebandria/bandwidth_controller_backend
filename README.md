@@ -134,3 +134,8 @@ Exemple d'Utilisation avec curl
 ### 4. Réinitialiser la mise en forme (Cleanup) :
 
     curl -X POST http://localhost:8080/qos/reset -H "Content-Type: application/json" -d '{"lan_interface": "wlo1", "wan_interface": "eno2"}'
+
+### 5. Appliquer une limite HTB de 50Mbit/s à l'ip 10.0.0.8 :
+
+    curl -X POST http://localhost:8080/qos/ip/limit "Content-Type: application/json" -d '{"ip":"10.0.0.8","rate_limit":"10mbit"}'
+
