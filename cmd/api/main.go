@@ -14,6 +14,7 @@ import (
 
     _ "bandwidth_controller_backend/docs" 
     "bandwidth_controller_backend/internal/adapter/handler"
+    "bandwidth_controller_backend/internal/adapter/repository"
     "bandwidth_controller_backend/internal/adapter/system"
     "bandwidth_controller_backend/internal/core/service"
 )
@@ -67,6 +68,11 @@ func main() {
     // 3. Initialiser le Handler
     qosHandler := handler.NewNetworkHandler(qosService, networkDriver, lanInterface, wanInterface)
 
+    // 4. Initialize Auth Service and Handler
+    authRepo := adapter.NewInMemoryAuthRepository()
+    authService := service.NewAuthService(authRepo)
+    authHandler := handler.NewAuthHandler(authService)
+
     log.Printf("Cleaning up interface %s and %s on startup...", wanInterface, lanInterface)
     
     
@@ -80,25 +86,47 @@ func main() {
     // --- Configuration des Routes Gin ---
     r := gin.Default()
     
+    // CORS Middleware for frontend
+    r.Use(func(c *gin.Context) {
+        c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+        c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+        c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        if c.Request.Method == "OPTIONS" {
+            c.AbortWithStatus(204)
+            return
+        }
+        c.Next()
+    })
+    
     // --- Swagger Route ---
     // Serves the Swagger UI at http://localhost:8080/swagger/index.html
     r.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
     log.Println("Swagger documentation available at /swagger/index.html")
     
+    // --- Auth Routes (Public) ---
+    r.POST("/auth/login", authHandler.Login)
+    r.POST("/auth/logout", authHandler.Logout)
+    r.GET("/auth/me", authHandler.AuthMiddleware(), authHandler.GetCurrentUser)
+    log.Println("Authentication routes initialized")
+    
+    // --- Protected Routes Group ---
+    protected := r.Group("/")
+    // protected.Use(authHandler.AuthMiddleware()) // Uncomment to enable auth protection
+    
     // Routes QoS Globales
-    r.POST("/qos/setup", qosHandler.SetupGlobalHandler)
-    r.POST("/qos/htb/global/limit", qosHandler.UpdateHTBGlobalLimit)
-    r.POST("/qos/simple/limit", qosHandler.UpdateSimpleLimit)
-    r.POST("/qos/reset", qosHandler.ResetShapingHandler)
+    protected.POST("/qos/setup", qosHandler.SetupGlobalHandler)
+    protected.POST("/qos/htb/global/limit", qosHandler.UpdateHTBGlobalLimit)
+    protected.POST("/qos/simple/limit", qosHandler.UpdateSimpleLimit)
+    protected.POST("/qos/reset", qosHandler.ResetShapingHandler)
 
     // Routes QoS par IP (Nouveaux Endpoints)
-    r.POST("/qos/ip/limit", qosHandler.AddIPRateLimitHandler)
-    r.POST("/qos/ip/remove", qosHandler.RemoveIPRateLimitHandler) // Note: Il faudra ajouter cette méthode au handler
+    protected.POST("/qos/ip/limit", qosHandler.AddIPRateLimitHandler)
+    protected.POST("/qos/ip/remove", qosHandler.RemoveIPRateLimitHandler)
 
     // Routes de Statut et Monitoring
-    r.GET("/status/lanips", qosHandler.GetConnectedLANIPsHandler)
-    r.GET("/qos/stats", qosHandler.GetTrafficStatsHandler)
-    r.GET("/qos/stream", qosHandler.StreamTrafficStatsHandler)
+    protected.GET("/status/lanips", qosHandler.GetConnectedLANIPsHandler)
+    protected.GET("/qos/stats", qosHandler.GetTrafficStatsHandler)
+    protected.GET("/qos/stream", qosHandler.StreamTrafficStatsHandler)
 
 
     port := "8080"
