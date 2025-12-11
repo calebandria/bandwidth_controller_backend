@@ -18,7 +18,7 @@ type LoginRequest struct {
 
 // LoginResponse represents the authentication response
 type LoginResponse struct {
-	Token string `json:"token"`
+	Token string   `json:"token"`
 	User  UserInfo `json:"user"`
 }
 
@@ -31,7 +31,7 @@ type UserInfo struct {
 
 // TokenClaims represents JWT token claims
 type TokenClaims struct {
-	Username string `json:"sub"`
+	Username string `json:"username"`
 	Role     string `json:"role"`
 	Exp      int64  `json:"exp"`
 }

@@ -29,26 +29,27 @@ var ipStateMutex sync.RWMutex
 // LinuxDriver implements the NetworkDriver interface using Linux tc and iptables.
 type LinuxDriver struct {
 	// activeIPs tracks the class ID assigned to an IP to manage HTB classes (local state for QoS)
-	activeIPs ActiveIPConfig
-	mu          sync.Mutex // Mutex for protecting activeIPs and nextClassID
-	nextClassID uint16     // Counter to assign unique class IDs starting from 10
-	isHTBReady bool
+	activeIPs     ActiveIPConfig
+	mu            sync.Mutex // Mutex for protecting activeIPs, nextClassID and freedClassIDs
+	nextClassID   uint16     // Counter to assign unique class IDs starting from 10
+	freedClassIDs []uint16   // Pool of recycled class IDs available for reuse
+	isHTBReady    bool
 }
-
 
 func NewLinuxDriver() port.NetworkDriver {
 	return &LinuxDriver{
-		activeIPs:   make(ActiveIPConfig),
-		nextClassID: 10, // Start with 10 (1:1 is root)
-		isHTBReady: false,
+		activeIPs:     make(ActiveIPConfig),
+		nextClassID:   10,                // Start with 10 (1:1 is root)
+		freedClassIDs: make([]uint16, 0), // Pool pour recycler les IDs
+		isHTBReady:    false,
 	}
 }
 
 // IsHTBInitialized implements the necessary check for QoSManager.
 func (l *LinuxDriver) IsHTBInitialized(ctx context.Context, lanInterface, wanInterface string) bool {
-    l.mu.Lock()
-    defer l.mu.Unlock()
-    return l.isHTBReady
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.isHTBReady
 }
 
 // applyTcCommand executes a 'tc' command and handles errors.
@@ -162,8 +163,8 @@ func (l *LinuxDriver) SetupHTBStructure(ctx context.Context, ilan string, iwan s
 	}
 
 	l.mu.Lock()
-    l.isHTBReady = true
-    l.mu.Unlock()
+	l.isHTBReady = true
+	l.mu.Unlock()
 
 	return nil
 }
@@ -194,58 +195,58 @@ func (l *LinuxDriver) ApplyGlobalShaping(ctx context.Context, rule domain.QoSRul
 
 // ResetShaping deletes the root qdisc on both interfaces.
 func (l *LinuxDriver) ResetShaping(ctx context.Context, ilan string, iwan string) error {
-    var firstErr error
+	var firstErr error
 
+	delQdisc := func(iface string) error {
+		cmd := exec.CommandContext(ctx, "tc", "qdisc", "del", "dev", iface, "root")
+		output, err := cmd.CombinedOutput()
 
-    delQdisc := func(iface string) error {
-        cmd := exec.CommandContext(ctx, "tc", "qdisc", "del", "dev", iface, "root")
-        output, err := cmd.CombinedOutput()
+		if err != nil {
+			outputStr := string(output)
 
-        if err != nil {
-            outputStr := string(output)
-            
-            // --- CRITICAL FIX START ---
-            // 1. Check for the specific error when no qdisc exists (your observed error)
-            // 2. The generic "Cannot delete specified qdisc" error is also returned when the handle is missing.
-            if strings.Contains(outputStr, "Cannot delete qdisc with handle of zero") ||
-               strings.Contains(outputStr, "Cannot delete specified qdisc") {
-                log.Printf("INFO: No root qdisc found on %s, treating as successful reset.", iface)
-                return nil // Treat "no qdisc exists" as a success (idempotency)
-            }
-            // --- CRITICAL FIX END ---
+			// --- CRITICAL FIX START ---
+			// 1. Check for the specific error when no qdisc exists (your observed error)
+			// 2. The generic "Cannot delete specified qdisc" error is also returned when the handle is missing.
+			if strings.Contains(outputStr, "Cannot delete qdisc with handle of zero") ||
+				strings.Contains(outputStr, "Cannot delete specified qdisc") {
+				log.Printf("INFO: No root qdisc found on %s, treating as successful reset.", iface)
+				return nil // Treat "no qdisc exists" as a success (idempotency)
+			}
+			// --- CRITICAL FIX END ---
 
-            // The previously checked (but less specific) errors:
-            if strings.Contains(outputStr, "No such file or directory") || strings.Contains(outputStr, "Invalid argument") {
-                return nil
-            }
+			// The previously checked (but less specific) errors:
+			if strings.Contains(outputStr, "No such file or directory") || strings.Contains(outputStr, "Invalid argument") {
+				return nil
+			}
 
-            // Log and return an actual failure
-            log.Printf("ERROR: Failed to reset shaping on %s. Output: %s", iface, outputStr)
-            return fmt.Errorf("failed to delete qdisc on %s: %s", iface, outputStr)
-        }
-        
-        log.Printf("QDisc reset successful on %s.", iface)
-        return nil
-    }
-    
-    // Clear local state tracking when resetting the entire QoS
-    l.mu.Lock()
-    l.activeIPs = make(ActiveIPConfig) // Assuming ActiveIPConfig is your map type
-    l.nextClassID = 10
+			// Log and return an actual failure
+			log.Printf("ERROR: Failed to reset shaping on %s. Output: %s", iface, outputStr)
+			return fmt.Errorf("failed to delete qdisc on %s: %s", iface, outputStr)
+		}
+
+		log.Printf("QDisc reset successful on %s.", iface)
+		return nil
+	}
+
+	// Clear local state tracking when resetting the entire QoS
+	l.mu.Lock()
+	l.activeIPs = make(ActiveIPConfig) // Assuming ActiveIPConfig is your map type
+	l.nextClassID = 10
+	l.freedClassIDs = make([]uint16, 0) // Vider le pool de recyclage
 	l.isHTBReady = false
-    l.mu.Unlock()
+	l.mu.Unlock()
 
-    if err := delQdisc(ilan); err != nil {
-        firstErr = err
-    }
+	if err := delQdisc(ilan); err != nil {
+		firstErr = err
+	}
 
-    if err := delQdisc(iwan); err != nil {
-        if firstErr == nil {
-            firstErr = err
-        }
-    }
+	if err := delQdisc(iwan); err != nil {
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
 
-    return firstErr
+	return firstErr
 }
 
 // GetConnectedLANIPs reads the ARP/Neighbor table.
@@ -401,17 +402,25 @@ func (l *LinuxDriver) AddIPRateLimit(ctx context.Context, ip string, rule domain
 		log.Printf("IP %s already has an HTB class assigned. Re-using or attempting update.", ip)
 		// For the monitoring setup, the QoSManager handles removal/re-addition, so we proceed if the class is not present
 		// but if it is present, we should handle the update instead of re-creating everything.
-		// Given the QoSManager logic, we assume AddIPRateLimit is called only if the IP is NOT in activeIPLimits 
+		// Given the QoSManager logic, we assume AddIPRateLimit is called only if the IP is NOT in activeIPLimits
 		// (or if the QoSManager explicitly requested removal before adding).
 	}
-	
-	// Check if this is a known IP being re-added after manual removal. If so, don't increment.
-	// For robustness, we stick to sequential ID for simple class creation.
-	classID := l.nextClassID
-	l.nextClassID++
+
+	// Réutiliser un classID recyclé ou en créer un nouveau
+	var classID uint16
+	if len(l.freedClassIDs) > 0 {
+		// Réutiliser un ID recyclé (LIFO - dernier libéré, premier réutilisé)
+		classID = l.freedClassIDs[len(l.freedClassIDs)-1]
+		l.freedClassIDs = l.freedClassIDs[:len(l.freedClassIDs)-1]
+		log.Printf("Reusing recycled HTB Class/Mark ID 1:%d for IP %s", classID, ip)
+	} else {
+		// Pas d'ID recyclé disponible, incrémenter
+		classID = l.nextClassID
+		l.nextClassID++
+		log.Printf("Assigning new HTB Class/Mark ID 1:%d to IP %s", classID, ip)
+	}
 
 	l.activeIPs[ip] = classID
-	log.Printf("Assigning HTB Class/Mark ID 1:%d to IP %s", classID, ip)
 
 	markID := fmt.Sprintf("%d", classID)
 
@@ -535,6 +544,10 @@ func (l *LinuxDriver) RemoveIPRateLimit(ctx context.Context, ip string, rule dom
 		log.Printf("Warning: Failed to delete iptables Rx mark for %s: %v", ip, err)
 	}
 
+	// Ajouter le classID au pool de recyclage pour réutilisation future
+	l.freedClassIDs = append(l.freedClassIDs, classID)
+	log.Printf("Recycling HTB Class ID %d (freed from IP %s) - Pool size: %d", classID, ip, len(l.freedClassIDs))
+
 	delete(l.activeIPs, ip)
 	log.Printf("IP QoS successfully removed for %s", ip)
 	return nil
@@ -542,39 +555,39 @@ func (l *LinuxDriver) RemoveIPRateLimit(ctx context.Context, ip string, rule dom
 
 // internal/adapter/system/linux_driver.go
 func (l *LinuxDriver) GetInstantaneousClassStats(iface string, classID uint16) (domain.NetDevStats, error) {
-    markID := fmt.Sprintf("1:%d", classID)
+	markID := fmt.Sprintf("1:%d", classID)
 
-    // tc -s class show dev eth0 classid 1:10
-    args := []string{"-s", "class", "show", "dev", iface, "classid", markID}
-    // Remplace ExecCommand par exec.Command car l'implémentation de ExecCommand est inconnue et peut être simplifiée.
-    outputBytes, err := exec.Command("tc", args...).Output() 
-    output := string(outputBytes) // Convertir la sortie en chaîne
+	// tc -s class show dev eth0 classid 1:10
+	args := []string{"-s", "class", "show", "dev", iface, "classid", markID}
+	// Remplace ExecCommand par exec.Command car l'implémentation de ExecCommand est inconnue et peut être simplifiée.
+	outputBytes, err := exec.Command("tc", args...).Output()
+	output := string(outputBytes) // Convertir la sortie en chaîne
 
-    if err != nil {
-        // Si la classe n'existe pas, on retourne 0, c'est normal si la règle vient d'être supprimée.
-        // Utiliser l'erreur ou la sortie pour détecter "Object not found"
-        if strings.Contains(output, "Object not found") || strings.Contains(output, "No such device") {
-            log.Printf("[DEBUG] Class %s not found on %s, returning zero stats.", markID, iface)
-            return domain.NetDevStats{}, nil
-        }
-        return domain.NetDevStats{}, fmt.Errorf("failed to read tc class stats for %s on %s: %w, output: %s", markID, iface, err, output)
-    }
-    
-    re := regexp.MustCompile(`Sent\s+(\d+)\s+bytes\s+(\d+)\s+(?:pkt|packets)s?`) 
+	if err != nil {
+		// Si la classe n'existe pas, on retourne 0, c'est normal si la règle vient d'être supprimée.
+		// Utiliser l'erreur ou la sortie pour détecter "Object not found"
+		if strings.Contains(output, "Object not found") || strings.Contains(output, "No such device") {
+			log.Printf("[DEBUG] Class %s not found on %s, returning zero stats.", markID, iface)
+			return domain.NetDevStats{}, nil
+		}
+		return domain.NetDevStats{}, fmt.Errorf("failed to read tc class stats for %s on %s: %w, output: %s", markID, iface, err, output)
+	}
 
-    matches := re.FindStringSubmatch(output)
-    
-    if len(matches) < 3 {
-        return domain.NetDevStats{}, nil 
-    }
+	re := regexp.MustCompile(`Sent\s+(\d+)\s+bytes\s+(\d+)\s+(?:pkt|packets)s?`)
 
-    bytes, _ := strconv.ParseUint(matches[1], 10, 64)
+	matches := re.FindStringSubmatch(output)
 
-    return domain.NetDevStats{
-        TxBytes: bytes, 
-        RxBytes: 0,     
-    }, nil
-} 
+	if len(matches) < 3 {
+		return domain.NetDevStats{}, nil
+	}
+
+	bytes, _ := strconv.ParseUint(matches[1], 10, 64)
+
+	return domain.NetDevStats{
+		TxBytes: bytes,
+		RxBytes: 0,
+	}, nil
+}
 
 func (l *LinuxDriver) CalculateIPRateMbps(ip string, iface string, classID uint16, currentStats domain.NetDevStats) (rateMbps float64, err error) {
 
@@ -598,7 +611,7 @@ func (l *LinuxDriver) CalculateIPRateMbps(ip string, iface string, classID uint1
 	timeDiff := currentTime.Sub(state.LastTime).Seconds()
 
 	if timeDiff == 0 {
-		return 0, nil 
+		return 0, nil
 	}
 
 	// Le compteur est stocké dans TxBytes
@@ -625,4 +638,210 @@ func (l *LinuxDriver) CalculateIPRateMbps(ip string, iface string, classID uint1
 	state.LastTime = currentTime
 
 	return rateMbps, nil
+}
+
+// CalculateIPTrafficRateFromIptables calcule le taux de transfert en Mbps à partir des compteurs iptables
+// pour les IPs sans classe HTB (sous limite globale uniquement)
+func (l *LinuxDriver) CalculateIPTrafficRateFromIptables(ip string, lanInterface string, currentBytes uint64, isUpload bool) (float64, error) {
+	// Créer une clé unique pour cet IP et direction
+	direction := "download"
+	if isUpload {
+		direction = "upload"
+	}
+	stateKey := fmt.Sprintf("%s-%s-%s-iptables", ip, lanInterface, direction)
+
+	ipStateMutex.Lock()
+	defer ipStateMutex.Unlock()
+
+	state, exists := ipTrafficState[stateKey]
+	if !exists {
+		// Première lecture - initialiser l'état
+		ipTrafficState[stateKey] = &domain.TrafficState{
+			LastStats: domain.NetDevStats{TxBytes: currentBytes},
+			LastTime:  time.Now(),
+			Mu:        sync.Mutex{},
+		}
+		return 0, nil
+	}
+
+	currentTime := time.Now()
+	timeDiff := currentTime.Sub(state.LastTime).Seconds()
+
+	if timeDiff == 0 {
+		return 0, nil
+	}
+
+	lastBytes := state.LastStats.TxBytes
+	byteDiff := int64(currentBytes) - int64(lastBytes)
+
+	if byteDiff < 0 {
+		byteDiff = 0 // Handle counter reset
+	}
+
+	// Calculer le taux en Bytes/sec puis convertir en Mbps
+	rateBps := float64(byteDiff) / timeDiff
+	const factor = 8.0 / 1024.0 / 1024.0
+	rateMbps := rateBps * factor
+
+	// Mettre à jour l'état
+	state.LastStats.TxBytes = currentBytes
+	state.LastTime = currentTime
+
+	return rateMbps, nil
+}
+
+// EnsureIPCountingRules crée des règles iptables de comptage pour un IP (sans MARK ni limite)
+// Permet de collecter les stats de trafic même pour les IPs sans classe HTB
+func (l *LinuxDriver) EnsureIPCountingRules(ctx context.Context, ip string, lanInterface, wanInterface string) error {
+	// Règle FORWARD pour compter upload (LAN -> WAN)
+	// Utilise -s (source) pour le trafic sortant du client
+	checkArgs := []string{"-C", "FORWARD", "-s", ip, "-o", wanInterface, "-j", "ACCEPT"}
+	cmd := exec.CommandContext(ctx, "iptables", checkArgs...)
+	if err := cmd.Run(); err != nil {
+		// Règle n'existe pas, la créer
+		addArgs := []string{"-I", "FORWARD", "1", "-s", ip, "-o", wanInterface, "-j", "ACCEPT"}
+		if err := applyIptablesCommand(ctx, addArgs); err != nil {
+			return fmt.Errorf("failed to add upload counting rule for %s: %w", ip, err)
+		}
+		log.Printf("Created upload counting rule for IP %s (FORWARD)", ip)
+	}
+
+	// Règle FORWARD pour compter download (WAN -> LAN)
+	// Utilise -d (destination) pour le trafic entrant vers le client
+	checkArgs = []string{"-C", "FORWARD", "-d", ip, "-i", wanInterface, "-j", "ACCEPT"}
+	cmd = exec.CommandContext(ctx, "iptables", checkArgs...)
+	if err := cmd.Run(); err != nil {
+		// Règle n'existe pas, la créer
+		addArgs := []string{"-I", "FORWARD", "1", "-d", ip, "-i", wanInterface, "-j", "ACCEPT"}
+		if err := applyIptablesCommand(ctx, addArgs); err != nil {
+			return fmt.Errorf("failed to add download counting rule for %s: %w", ip, err)
+		}
+		log.Printf("Created download counting rule for IP %s (FORWARD)", ip)
+	}
+
+	return nil
+}
+
+// BlockDevice bloque un device en ajoutant une règle iptables DROP sur le WAN interface
+func (l *LinuxDriver) BlockDevice(ctx context.Context, ip string, wanInterface string) error {
+	log.Printf("Blocking device %s on %s", ip, wanInterface)
+
+	// Bloquer le trafic sortant (FORWARD chain) pour cette IP vers le WAN
+	// DROP packets from this IP going to WAN (egress)
+	args := []string{"-I", "FORWARD", "1", "-s", ip, "-o", wanInterface, "-j", "DROP"}
+	if err := applyIptablesCommand(ctx, args); err != nil {
+		return fmt.Errorf("failed to block device %s: %w", ip, err)
+	}
+
+	// Bloquer également le trafic entrant (FORWARD chain) depuis le WAN vers cette IP
+	// DROP packets from WAN to this IP (ingress)
+	args = []string{"-I", "FORWARD", "1", "-i", wanInterface, "-d", ip, "-j", "DROP"}
+	if err := applyIptablesCommand(ctx, args); err != nil {
+		// Tenter de nettoyer la première règle si la deuxième échoue
+		_ = applyIptablesCommand(ctx, []string{"-D", "FORWARD", "-s", ip, "-o", wanInterface, "-j", "DROP"})
+		return fmt.Errorf("failed to block device %s (ingress): %w", ip, err)
+	}
+
+	log.Printf("Successfully blocked device %s", ip)
+	return nil
+}
+
+// UnblockDevice débloque un device en supprimant les règles iptables DROP
+func (l *LinuxDriver) UnblockDevice(ctx context.Context, ip string, wanInterface string) error {
+	log.Printf("Unblocking device %s on %s", ip, wanInterface)
+
+	var lastErr error
+
+	// Supprimer la règle de blocage sortant (egress)
+	args := []string{"-D", "FORWARD", "-s", ip, "-o", wanInterface, "-j", "DROP"}
+	if err := applyIptablesCommand(ctx, args); err != nil {
+		log.Printf("Warning: failed to remove egress block rule for %s: %v", ip, err)
+		lastErr = err
+	}
+
+	// Supprimer la règle de blocage entrant (ingress)
+	args = []string{"-D", "FORWARD", "-i", wanInterface, "-d", ip, "-j", "DROP"}
+	if err := applyIptablesCommand(ctx, args); err != nil {
+		log.Printf("Warning: failed to remove ingress block rule for %s: %v", ip, err)
+		if lastErr == nil {
+			lastErr = err
+		}
+	}
+
+	if lastErr != nil {
+		return fmt.Errorf("failed to fully unblock device %s: %w", ip, lastErr)
+	}
+
+	log.Printf("Successfully unblocked device %s", ip)
+	return nil
+}
+
+// GetIPTrafficBytes lit les compteurs iptables pour obtenir les bytes d'un IP spécifique
+// Retourne (upload_bytes, download_bytes, error)
+// Upload = trafic sortant du LAN vers WAN (FORWARD, source = IP, out = WAN)
+// Download = trafic entrant du WAN vers LAN (FORWARD, destination = IP, in = WAN)
+func (l *LinuxDriver) GetIPTrafficBytes(ctx context.Context, ip string, wanInterface string) (uint64, uint64, error) {
+	var uploadBytes, downloadBytes uint64
+
+	// Lire les compteurs FORWARD
+	cmd := exec.CommandContext(ctx, "iptables", "-L", "FORWARD", "-n", "-v", "-x")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to read FORWARD counters: %w", err)
+	}
+
+	// Parser la sortie pour trouver les lignes correspondant à cet IP
+	// Format typique: "  pkts      bytes target     prot opt in     out     source               destination"
+	// Upload:         "  1234    567890 ACCEPT     all  --  *      eno2    192.168.1.10         0.0.0.0/0"
+	// Download:       "  1234    567890 ACCEPT     all  --  eno2   *       0.0.0.0/0            192.168.1.10"
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) < 9 {
+			continue
+		}
+
+		// Chercher upload : source = IP, out = wanInterface
+		// Format: pkts bytes target prot opt in out source destination
+		// Index:    0     1      2    3    4   5   6     7         8
+		if fields[7] == ip && fields[6] == wanInterface {
+			if bytes, err := strconv.ParseUint(fields[1], 10, 64); err == nil {
+				uploadBytes = bytes
+			}
+		}
+
+		// Chercher download : destination = IP, in = wanInterface
+		if fields[8] == ip && fields[5] == wanInterface {
+			if bytes, err := strconv.ParseUint(fields[1], 10, 64); err == nil {
+				downloadBytes = bytes
+			}
+		}
+	}
+
+	return uploadBytes, downloadBytes, nil
+}
+
+// IsDeviceBlocked vérifie si un device est bloqué en listant les règles iptables
+func (l *LinuxDriver) IsDeviceBlocked(ctx context.Context, ip string, wanInterface string) (bool, error) {
+	// Lister les règles de la FORWARD chain
+	cmd := exec.CommandContext(ctx, "iptables", "-L", "FORWARD", "-n", "-v")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("failed to list iptables rules: %w", err)
+	}
+
+	outputStr := string(output)
+
+	// Chercher une règle DROP pour cette IP sur le WAN interface
+	// Format typique: "0     0 DROP       all  --  *      eno2    192.168.1.10         0.0.0.0/0"
+	lines := strings.Split(outputStr, "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "DROP") &&
+			strings.Contains(line, ip) &&
+			strings.Contains(line, wanInterface) {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }

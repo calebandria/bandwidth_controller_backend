@@ -9,6 +9,8 @@ type IPRateMonitor interface {
 	GetActiveIPs() map[string]uint16
 	GetInstantaneousClassStats(iface string, classID uint16) (domain.NetDevStats, error)
 	CalculateIPRateMbps(ip string, iface string, classID uint16, currentStats domain.NetDevStats) (rateMbps float64, err error)
+	GetIPTrafficBytes(ctx context.Context, ip string, wanInterface string) (uint64, uint64, error)
+	CalculateIPTrafficRateFromIptables(ip string, lanInterface string, currentBytes uint64, isUpload bool) (float64, error)
 }
 
 type NetworkDriver interface {
@@ -22,6 +24,10 @@ type NetworkDriver interface {
 	RemoveIPRateLimit(ctx context.Context, ip string, rule domain.QoSRule) error
 	AddIPRateLimit(ctx context.Context, ip string, rule domain.QoSRule) error
 	IsHTBInitialized(ctx context.Context, lanInterface, wanInterface string) bool
+	BlockDevice(ctx context.Context, ip string, wanInterface string) error
+	UnblockDevice(ctx context.Context, ip string, wanInterface string) error
+	IsDeviceBlocked(ctx context.Context, ip string, wanInterface string) (bool, error)
+	EnsureIPCountingRules(ctx context.Context, ip string, lanInterface, wanInterface string) error
 }
 
 type QoSService interface {
@@ -32,5 +38,8 @@ type QoSService interface {
 	GetConnectedLANIPs(ctx context.Context, ilan string) ([]string, error)
 	AddIPRateLimit(ctx context.Context, ip string, rule domain.QoSRule) error
 	RemoveIPRateLimit(ctx context.Context, ip string) error
-	GetStatsStream() <-chan domain.IPTrafficStat
+	GetStatsStream() <-chan domain.TrafficUpdate
+	BlockDevice(ctx context.Context, ip string) error
+	UnblockDevice(ctx context.Context, ip string) error
+	IsDeviceBlocked(ctx context.Context, ip string) (bool, error)
 }

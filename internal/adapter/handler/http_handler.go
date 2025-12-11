@@ -16,8 +16,8 @@ import (
 // --- Request Structs ---
 
 type RuleUpdateRequest struct {
-	RateLimit    string `json:"rate_limit" binding:"required" example:"10mbit"`
-	Latency      string `json:"latency" example:"50ms"`
+	RateLimit string `json:"rate_limit" binding:"required" example:"10mbit"`
+	Latency   string `json:"latency" example:"50ms"`
 }
 
 type SetupRequest struct {
@@ -25,8 +25,8 @@ type SetupRequest struct {
 }
 
 type IPControlRequest struct {
-	IP           string `json:"ip" binding:"required" example:"192.168.1.10"`
-	RateLimit    string `json:"rate_limit,omitempty" example:"5mbit"`
+	IP        string `json:"ip" binding:"required" example:"192.168.1.10"`
+	RateLimit string `json:"rate_limit,omitempty" example:"5mbit"`
 }
 
 type IPTrafficStat struct {
@@ -38,14 +38,13 @@ type IPTrafficStat struct {
 
 }
 
-
 type InterfaceStats struct {
-	InterfaceName string `json:"interface_name" example:"eth0"`
-	CurrentRateRxMbps float64 `json:"current_rate_rx_mbps" example:"5.5"` 
-	CurrentRateTxMbps float64 `json:"current_rate_tx_mbps" example:"12.8"` 
-	TotalBytesTx  uint64 `json:"total_bytes_tx" example:"2351000"` 
-	TotalBytesRx  uint64 `json:"total_bytes_rx" example:"1100000"` 
-	IPStats  map[string]IPTrafficStat `json:"ip_stats"` // Empty for now
+	InterfaceName     string                   `json:"interface_name" example:"eth0"`
+	CurrentRateRxMbps float64                  `json:"current_rate_rx_mbps" example:"5.5"`
+	CurrentRateTxMbps float64                  `json:"current_rate_tx_mbps" example:"12.8"`
+	TotalBytesTx      uint64                   `json:"total_bytes_tx" example:"2351000"`
+	TotalBytesRx      uint64                   `json:"total_bytes_rx" example:"1100000"`
+	IPStats           map[string]IPTrafficStat `json:"ip_stats"` // Empty for now
 }
 
 // --- Handler Structure ---
@@ -59,19 +58,19 @@ type NetworkHandler struct {
 }
 
 type ScheduleEntry struct {
-    StartTime time.Time `json:"start_time" binding:"required" example:"2025-12-31T20:00:00Z"`
-    EndTime   time.Time `json:"end_time" binding:"required" example:"2026-01-01T08:00:00Z"`
+	StartTime time.Time `json:"start_time" binding:"required" example:"2025-12-31T20:00:00Z"`
+	EndTime   time.Time `json:"end_time" binding:"required" example:"2026-01-01T08:00:00Z"`
 }
 
 // @Description Requête pour planifier une mise à jour de la limite globale HTB.
 type ScheduledRuleRequest struct {
-    RuleUpdateRequest
-    ScheduleEntry
+	RuleUpdateRequest
+	ScheduleEntry
 }
 
 type ScheduledIPControlRequest struct {
-    IPControlRequest
-    ScheduleEntry
+	IPControlRequest
+	ScheduleEntry
 }
 
 func NewNetworkHandler(svc port.QoSService, netDriver port.NetworkDriver, ilan string, inet string) *NetworkHandler {
@@ -145,7 +144,12 @@ func (h *NetworkHandler) UpdateHTBGlobalLimit(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update HTB limit: " + err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"status": "HTB global limit updated successfully", "lan_interface": rule.LanInterface, "rate_limit": rule.WanInterface})
+	c.JSON(http.StatusOK, gin.H{
+		"status":        "HTB global limit updated successfully",
+		"lan_interface": rule.LanInterface,
+		"wan_interface": rule.WanInterface,
+		"rate_limit":    rule.Bandwidth,
+	})
 }
 
 // AddIPRateLimitHandler
@@ -319,13 +323,12 @@ func (h *NetworkHandler) GetTrafficStatsHandler(c *gin.Context) {
 
 	// Construction de la réponse
 	response := InterfaceStats{
-			InterfaceName:     lanInterface,
-			CurrentRateTxMbps: lanTxRate,
-			CurrentRateRxMbps: lanRxRate,
-			TotalBytesTx:      lanCurrentStats.TxBytes,
-			TotalBytesRx:      lanCurrentStats.RxBytes,
-			IPStats:           make(map[string]IPTrafficStat),
-		
+		InterfaceName:     lanInterface,
+		CurrentRateTxMbps: lanTxRate,
+		CurrentRateRxMbps: lanRxRate,
+		TotalBytesTx:      lanCurrentStats.TxBytes,
+		TotalBytesRx:      lanCurrentStats.RxBytes,
+		IPStats:           make(map[string]IPTrafficStat),
 	}
 	c.JSON(http.StatusOK, response)
 }
@@ -344,34 +347,37 @@ func (h *NetworkHandler) StreamTrafficStatsHandler(c *gin.Context) {
 	}
 	defer conn.Close()
 
-	// Le service expose un canal de statistiques par IP
+	// Le service expose un canal de statistiques (IP et globales)
 	statsStream := h.svc.GetStatsStream()
 
-	log.Printf("Démarrage du streaming WebSocket via QoSManager statsStream.")
-	
+	log.Printf("Démarrage du streaming WebSocket pour statistiques IP et globales.")
+
 	for {
 		select {
 		case <-c.Request.Context().Done():
 			// Le client HTTP (Gin) est déconnecté/le contexte est annulé.
 			log.Println("Client déconnecté (contexte HTTP terminé), arrêt du streaming.")
 			return
-		case stat, ok := <-statsStream:
+		case update, ok := <-statsStream:
 			if !ok {
 				// Le canal du service a été fermé.
 				log.Println("Le canal de statistiques du QoSManager est fermé.")
 				return
 			}
-			
-			// Le type service.IPTrafficStat contient toutes les infos par IP.
-			// Nous pouvons l'envoyer directement.
-			// NOTE: Nous utilisons le type stat du package service pour la diffusion.
-			if err := conn.WriteJSON(stat); err != nil {
+
+			// Envoyer l'update qui peut contenir soit des stats IP, soit des stats globales
+			if err := conn.WriteJSON(update); err != nil {
 				// Erreur d'écriture (client déconnecté, connexion rompue)
 				log.Printf("Erreur d'écriture WebSocket (client déconnecté ?): %v", err)
-				return 
+				return
 			}
 
-			// log.Printf("Streaming: Envoi des données pour IP %s (Tx: %.2f Mbps)", stat.IP, stat.UploadRate)
+			// Log optionnel pour debug
+			// if update.Type == "ip" && update.IPStat != nil {
+			// 	log.Printf("Streaming IP: %s (Tx: %.2f Mbps)", update.IPStat.IP, update.IPStat.UploadRate)
+			// } else if update.Type == "global" && update.GlobalStat != nil {
+			// 	log.Printf("Streaming Global: LAN Tx: %.2f Mbps", update.GlobalStat.LanUploadRate)
+			// }
 		default:
 			// Utiliser un court délai pour éviter une boucle de CPU intensive si le canal est vide
 			time.Sleep(10 * time.Millisecond)
@@ -391,21 +397,21 @@ func (h *NetworkHandler) StreamTrafficStatsHandler(c *gin.Context) {
 // @Failure 500 {string} string "Erreur lors de la planification"
 // @Router /qos/schedule/global [post]
 func (h *NetworkHandler) ScheduleGlobalLimitHandler(c *gin.Context) {
-    var req ScheduledRuleRequest
-    if err := c.ShouldBindJSON(&req); err != nil {
-        c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format: " + err.Error()})
-        return
-    }
+	var req ScheduledRuleRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format: " + err.Error()})
+		return
+	}
 
-    // Ici, vous appelleriez le service (h.svc) qui gère la logique de planification
-    // (par exemple, enregistrer la tâche dans une base de données ou un planificateur local).
-    log.Printf("Scheduling global limit %s from %s to %s on %s/%s", 
-        req.RateLimit, req.StartTime.Format(time.RFC3339), req.EndTime.Format(time.RFC3339), h.lanInterface, h.wanInterface)
+	// Ici, vous appelleriez le service (h.svc) qui gère la logique de planification
+	// (par exemple, enregistrer la tâche dans une base de données ou un planificateur local).
+	log.Printf("Scheduling global limit %s from %s to %s on %s/%s",
+		req.RateLimit, req.StartTime.Format(time.RFC3339), req.EndTime.Format(time.RFC3339), h.lanInterface, h.wanInterface)
 
-    // TODO: Implémenter h.svc.ScheduleGlobalLimit(req)
+	// TODO: Implémenter h.svc.ScheduleGlobalLimit(req)
 
-    c.JSON(http.StatusOK, gin.H{"status": "Global limit scheduled successfully", 
-        "start_time": req.StartTime.Format(time.RFC3339), "end_time": req.EndTime.Format(time.RFC3339)})
+	c.JSON(http.StatusOK, gin.H{"status": "Global limit scheduled successfully",
+		"start_time": req.StartTime.Format(time.RFC3339), "end_time": req.EndTime.Format(time.RFC3339)})
 }
 
 // ScheduleIPLimitHandler
@@ -420,19 +426,107 @@ func (h *NetworkHandler) ScheduleGlobalLimitHandler(c *gin.Context) {
 // @Failure 500 {string} string "Erreur lors de la planification"
 // @Router /qos/schedule/ip [post]
 func (h *NetworkHandler) ScheduleIPLimitHandler(c *gin.Context) {
-    var req ScheduledIPControlRequest
-    if err := c.ShouldBindJSON(&req); err != nil {
-        c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format: " + err.Error()})
-        return
-    }
+	var req ScheduledIPControlRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format: " + err.Error()})
+		return
+	}
 
-    // Ici, vous appelleriez le service (h.svc) qui gère la logique de planification
-    // (par exemple, enregistrer la tâche dans une base de données ou un planificateur local).
-    log.Printf("Scheduling IP limit %s for IP %s from %s to %s on %s", 
-        req.RateLimit, req.IP, req.StartTime.Format(time.RFC3339), req.EndTime.Format(time.RFC3339), h.lanInterface)
+	// Ici, vous appelleriez le service (h.svc) qui gère la logique de planification
+	// (par exemple, enregistrer la tâche dans une base de données ou un planificateur local).
+	log.Printf("Scheduling IP limit %s for IP %s from %s to %s on %s",
+		req.RateLimit, req.IP, req.StartTime.Format(time.RFC3339), req.EndTime.Format(time.RFC3339), h.lanInterface)
 
-    // TODO: Implémenter h.svc.ScheduleIPLimit(req)
+	// TODO: Implémenter h.svc.ScheduleIPLimit(req)
 
-    c.JSON(http.StatusOK, gin.H{"status": "IP limit scheduled successfully", 
-        "ip_address": req.IP, "start_time": req.StartTime.Format(time.RFC3339), "end_time": req.EndTime.Format(time.RFC3339)})
+	c.JSON(http.StatusOK, gin.H{"status": "IP limit scheduled successfully",
+		"ip_address": req.IP, "start_time": req.StartTime.Format(time.RFC3339), "end_time": req.EndTime.Format(time.RFC3339)})
+}
+
+// BlockDeviceHandler
+// @Summary Bloque un appareil en empêchant son accès à Internet
+// @Description Ajoute des règles iptables DROP pour bloquer le trafic d'une IP vers/depuis le WAN
+// @Tags Device Control
+// @Accept json
+// @Produce json
+// @Param request body IPControlRequest true "IP de l'appareil à bloquer"
+// @Success 200 {object} map[string]interface{} "status: Device blocked successfully"
+// @Failure 400 {object} map[string]string "error: Invalid request format"
+// @Failure 500 {object} map[string]string "error: Failed to block device"
+// @Router /qos/device/block [post]
+func (h *NetworkHandler) BlockDeviceHandler(c *gin.Context) {
+	var req IPControlRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format: " + err.Error()})
+		return
+	}
+
+	if err := h.svc.BlockDevice(c.Request.Context(), req.IP); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to block device: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status": "Device blocked successfully",
+		"ip":     req.IP,
+	})
+}
+
+// UnblockDeviceHandler
+// @Summary Débloque un appareil en restaurant son accès à Internet
+// @Description Supprime les règles iptables DROP pour débloquer le trafic d'une IP
+// @Tags Device Control
+// @Accept json
+// @Produce json
+// @Param request body IPControlRequest true "IP de l'appareil à débloquer"
+// @Success 200 {object} map[string]interface{} "status: Device unblocked successfully"
+// @Failure 400 {object} map[string]string "error: Invalid request format"
+// @Failure 500 {object} map[string]string "error: Failed to unblock device"
+// @Router /qos/device/unblock [post]
+func (h *NetworkHandler) UnblockDeviceHandler(c *gin.Context) {
+	var req IPControlRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format: " + err.Error()})
+		return
+	}
+
+	if err := h.svc.UnblockDevice(c.Request.Context(), req.IP); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to unblock device: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status": "Device unblocked successfully",
+		"ip":     req.IP,
+	})
+}
+
+// GetDeviceStatusHandler
+// @Summary Vérifie si un appareil est bloqué
+// @Description Retourne le statut de blocage d'une IP
+// @Tags Device Control
+// @Accept json
+// @Produce json
+// @Param ip query string true "IP de l'appareil à vérifier"
+// @Success 200 {object} map[string]interface{} "ip, blocked"
+// @Failure 400 {object} map[string]string "error: IP parameter required"
+// @Failure 500 {object} map[string]string "error: Failed to check device status"
+// @Router /qos/device/status [get]
+func (h *NetworkHandler) GetDeviceStatusHandler(c *gin.Context) {
+	ip := c.Query("ip")
+	if ip == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "IP parameter required"})
+		return
+	}
+
+	blocked, err := h.svc.IsDeviceBlocked(c.Request.Context(), ip)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check device status: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"ip":      ip,
+		"blocked": blocked,
+	})
 }

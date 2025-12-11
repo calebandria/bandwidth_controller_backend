@@ -9,28 +9,20 @@ import (
 	"log"
 	"sync"
 	"time"
-/* 	"github.com/go-co-op/gocron/v2" */
-)
+	/* 	"github.com/go-co-op/gocron/v2" */)
 
 const (
-	ModeGlobalTBF = "TBF"
-	ModeGlobalHTB = "HTB"
-	DefaultIPRate = "100mbit" // Débit par défaut appliqué aux nouvelles connexions pour le tracking.
+	ModeGlobalTBF       = "TBF"
+	ModeGlobalHTB       = "HTB"
+	DefaultIPRate       = "10mbit"        // Débit par défaut appliqué aux nouvelles connexions pour le tracking (conservateur pour éviter oversubscription)
+	IPInactivityTimeout = 5 * time.Minute // Temps d'inactivité avant de retirer la limite QoS
 )
-
-// IPTrafficStat représente les statistiques de trafic pour une IP donnée.
-type IPTrafficStat struct {
-	IP           string  `json:"ip"`
-	UploadRate   float64 `json:"upload_mbps"`
-	DownloadRate float64 `json:"download_mbps"`
-	IsLimited    bool    `json:"is_limited"`
-	Status       string  `json:"status"` // e.g., "Active", "New", "Disconnected"
-}
 
 // IPTrackingInfo stocke les informations nécessaires au suivi de l'état (y compris l'ID de la classe HTB)
 type IPTrackingInfo struct {
-	ClassID uint16
-	Rule    domain.QoSRule
+	ClassID    uint16
+	Rule       domain.QoSRule
+	LastSeenAt time.Time // Timestamp de la dernière détection de l'IP
 }
 
 // IPRateMonitor définit les méthodes étendues que le driver doit supporter
@@ -38,28 +30,31 @@ type IPTrackingInfo struct {
 // Ces méthodes sont celles que le service *suppose* être implémentées par le driver.
 
 type QoSManager struct {
-	driver      port.NetworkDriver
-	statsStream chan domain.IPTrafficStat // Changement de type pour les statistiques IP
-	threshold   uint64
-	ilan        string
-	inet        string
-	activeMode  string
+	driver           port.NetworkDriver
+	statsStream      chan domain.TrafficUpdate // Canal pour envoyer les statistiques IP et globales
+	threshold        uint64
+	ilan             string
+	inet             string
+	activeMode       string
 	globalSetupMutex sync.Mutex
-	
+
 	// Suivi des IPs actuellement limitées (et donc avec une classe HTB).
 	activeIPLimits map[string]IPTrackingInfo
-	ipMutex        sync.RWMutex
+	// Suivi de toutes les IPs détectées (même sans limite explicite)
+	detectedIPs map[string]time.Time // IP -> LastSeenAt
+	ipMutex     sync.RWMutex
 }
 
 func NewQoSManager(driver port.NetworkDriver, ilan string, inet string) *QoSManager {
 	mgr := &QoSManager{
-		driver:      driver,
-		statsStream: make(chan domain.IPTrafficStat, 100),
-		threshold:   100000000,
-		ilan:        ilan,
-		inet:        inet,
-		activeMode:  ModeGlobalTBF,
+		driver:         driver,
+		statsStream:    make(chan domain.TrafficUpdate, 100),
+		threshold:      100000000,
+		ilan:           ilan,
+		inet:           inet,
+		activeMode:     ModeGlobalTBF,
 		activeIPLimits: make(map[string]IPTrackingInfo),
+		detectedIPs:    make(map[string]time.Time),
 	}
 	return mgr
 }
@@ -73,6 +68,24 @@ func (s *QoSManager) SetupGlobalQoS(ctx context.Context, ilan string, inet strin
 }
 
 func (s *QoSManager) UpdateGlobalLimit(ctx context.Context, rule domain.QoSRule) error {
+	// Si HTB n'est pas initialisé, l'initialiser automatiquement
+	if !s.driver.IsHTBInitialized(ctx, rule.LanInterface, rule.WanInterface) {
+		log.Println("WARNING: HTB not initialized. Initializing automatically with bandwidth:", rule.Bandwidth)
+		s.globalSetupMutex.Lock()
+		defer s.globalSetupMutex.Unlock()
+
+		// Double-check après avoir acquis le lock
+		if !s.driver.IsHTBInitialized(ctx, rule.LanInterface, rule.WanInterface) {
+			if err := s.driver.SetupHTBStructure(ctx, rule.LanInterface, rule.WanInterface, rule.Bandwidth); err != nil {
+				return fmt.Errorf("failed to auto-initialize HTB structure: %w", err)
+			}
+			s.activeMode = ModeGlobalHTB
+			log.Println("HTB structure auto-initialized successfully")
+			// Pas besoin d'appeler ApplyGlobalShaping car SetupHTBStructure a déjà configuré la bande passante
+			return nil
+		}
+	}
+
 	if s.activeMode != ModeGlobalHTB {
 		return errors.New("HTB mode is not active. Please call /qos/setup first")
 	}
@@ -118,27 +131,27 @@ func (s *QoSManager) AddIPRateLimit(ctx context.Context, ip string, rule domain.
 	}
 
 	if !s.driver.IsHTBInitialized(ctx, rule.LanInterface, rule.WanInterface) {
-        log.Println("WARNING: Base HTB structure missing. Attempting lazy setup now.")
-        
-        // Use a dedicated setup lock to prevent multiple goroutines from running SetupGlobalQoS simultaneously.
-        // Assuming s.globalSetupMutex exists and protects SetupGlobalQoS from the outside.
-        // If not, you must create one.
-        s.globalSetupMutex.Lock() // Must lock BEFORE calling SetupGlobalQoS
-        defer s.globalSetupMutex.Unlock()
-        
-        // Re-check after acquiring the lock (in case another goroutine just finished the setup)
-        if !s.driver.IsHTBInitialized(ctx, rule.LanInterface, rule.WanInterface) {
-            setupCtx, setupCancel := context.WithTimeout(context.Background(), 5*time.Second)
-            defer setupCancel()
-            
-            // Re-run the critical setup logic
-            if err := s.SetupGlobalQoS(setupCtx, rule.LanInterface, rule.WanInterface, rule.Bandwidth); err != nil {
-                // If it fails here, the whole system has a problem, but we let it try again later.
-                return fmt.Errorf("failed lazy setup of global HTB: %w", err)
-            }
-            log.Println("Lazy HTB setup successful. Proceeding with IP rule.")
-        }
-    }
+		log.Println("WARNING: Base HTB structure missing. Attempting lazy setup now.")
+
+		// Use a dedicated setup lock to prevent multiple goroutines from running SetupGlobalQoS simultaneously.
+		// Assuming s.globalSetupMutex exists and protects SetupGlobalQoS from the outside.
+		// If not, you must create one.
+		s.globalSetupMutex.Lock() // Must lock BEFORE calling SetupGlobalQoS
+		defer s.globalSetupMutex.Unlock()
+
+		// Re-check after acquiring the lock (in case another goroutine just finished the setup)
+		if !s.driver.IsHTBInitialized(ctx, rule.LanInterface, rule.WanInterface) {
+			setupCtx, setupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer setupCancel()
+
+			// Re-run the critical setup logic
+			if err := s.SetupGlobalQoS(setupCtx, rule.LanInterface, rule.WanInterface, rule.Bandwidth); err != nil {
+				// If it fails here, the whole system has a problem, but we let it try again later.
+				return fmt.Errorf("failed lazy setup of global HTB: %w", err)
+			}
+			log.Println("Lazy HTB setup successful. Proceeding with IP rule.")
+		}
+	}
 
 	s.ipMutex.Lock()
 	defer s.ipMutex.Unlock()
@@ -150,7 +163,7 @@ func (s *QoSManager) AddIPRateLimit(ctx context.Context, ip string, rule domain.
 		delete(s.activeIPLimits, ip)
 		log.Printf("Existing rule for %s removed before re-adding.", ip)
 	}
-	
+
 	// Le driver ajoute la règle (création de la classe HTB et du filtre)
 	err := s.driver.AddIPRateLimit(ctx, ip, rule)
 	if err != nil {
@@ -163,7 +176,7 @@ func (s *QoSManager) AddIPRateLimit(ctx context.Context, ip string, rule domain.
 		Rule: rule,
 		// ClassID sera déduit/récupéré par le moniteur.
 	}
-	
+
 	log.Printf("IP %s successfully added to rate limits.", ip)
 	return nil
 }
@@ -188,9 +201,8 @@ func (s *QoSManager) RemoveIPRateLimit(ctx context.Context, ip string) error {
 	return nil
 }
 
-
 // GetStatsStream expose le canal pour la diffusion des statistiques en temps réel.
-func (s *QoSManager) GetStatsStream() <-chan domain.IPTrafficStat {
+func (s *QoSManager) GetStatsStream() <-chan domain.TrafficUpdate {
 	return s.statsStream
 }
 
@@ -198,10 +210,10 @@ func (s *QoSManager) GetStatsStream() <-chan domain.IPTrafficStat {
 // La fonction de tracking doit être lancée après SetupGlobalQoS.
 func (s *QoSManager) StartIPMonitoring(ctx context.Context, interval time.Duration) {
 	log.Println("Starting IP monitoring loop...")
-	
+
 	// Map pour stocker les IPs détectées
-	detectedIPs := make(map[string]bool) 
-	
+	detectedIPs := make(map[string]bool)
+
 	// Ticker pour la boucle de surveillance périodique
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -235,49 +247,56 @@ func (s *QoSManager) monitorLoop(ctx context.Context, detectedIPs map[string]boo
 	for _, ip := range connectedIPs {
 		currentConnectedSet[ip] = true
 	}
-	
+
 	// =========================================================
 	// 2. Gestion des Connexions/Déconnexions
 	// =========================================================
 
-	// Utilisation de RLock pour lire l'état afin de déterminer les IPs à retirer.
+	// --- Mettre à jour LastSeenAt pour les IPs connectées ---
+	now := time.Now()
+	s.ipMutex.Lock()
+	for _, ip := range connectedIPs {
+		if info, exists := s.activeIPLimits[ip]; exists {
+			info.LastSeenAt = now
+			s.activeIPLimits[ip] = info
+		}
+	}
+	s.ipMutex.Unlock()
+
+	// --- Identifier les IPs inactives depuis >IPInactivityTimeout ---
 	ipsToRemove := make([]string, 0)
 	s.ipMutex.RLock()
-	for ip := range s.activeIPLimits {
+	for ip, info := range s.activeIPLimits {
 		if !currentConnectedSet[ip] {
-			ipsToRemove = append(ipsToRemove, ip)
+			// IP absente de la table ARP - vérifier le timeout
+			if now.Sub(info.LastSeenAt) > IPInactivityTimeout {
+				ipsToRemove = append(ipsToRemove, ip)
+			}
 		}
 	}
 	s.ipMutex.RUnlock()
 
 	// --- Traiter les nouvelles IPs ---
 	for _, ip := range connectedIPs {
-		// Utilisation de RLock pour lire l'état de 'activeIPLimits' et vérifier si l'IP est déjà suivie.
-		s.ipMutex.RLock()
-		_, isTracked := s.activeIPLimits[ip]
-		s.ipMutex.RUnlock()
+		s.ipMutex.Lock()
+		if _, exists := s.detectedIPs[ip]; !exists {
+			// Nouvelle IP détectée - on la track sans créer de classe HTB
+			log.Printf("New IP detected: %s. Tracking under global limit only (no per-IP class).", ip)
 
-		if !isTracked {
-			// Nouvelle IP détectée, lui appliquer une limite par défaut pour le monitoring.
-			defaultRule := domain.QoSRule{
-				Bandwidth:    DefaultIPRate,
-				LanInterface: s.ilan,
-				WanInterface: s.inet,
-			}
-			log.Printf("New IP detected: %s. Applying default limit (%s) for monitoring.", ip, DefaultIPRate)
-			
-			// AddIPRateLimit gère son propre Lock()
-			if err := s.AddIPRateLimit(ctx, ip, defaultRule); err != nil {
-				 log.Printf("Warning: Failed to apply default tracking rule to new IP %s: %v", ip, err)
+			// Créer des règles iptables de comptage pour pouvoir lire les stats
+			if err := s.driver.EnsureIPCountingRules(ctx, ip, s.ilan, s.inet); err != nil {
+				log.Printf("Warning: Failed to create counting rules for IP %s: %v", ip, err)
 			}
 		}
+		s.detectedIPs[ip] = now // Mettre à jour LastSeenAt
+		s.ipMutex.Unlock()
 		detectedIPs[ip] = true // Marquer comme détecté lors de ce cycle
 	}
 
-	// --- Traiter les IPs déconnectées ---
+	// --- Traiter les IPs déconnectées (inactives >5 min) ---
 	for _, ip := range ipsToRemove {
-		log.Printf("IP %s disconnected. Removing rate limit.", ip)
-		
+		log.Printf("IP %s inactive for >%v. Removing rate limit.", ip, IPInactivityTimeout)
+
 		// RemoveIPRateLimit gère son propre Lock()
 		if err := s.RemoveIPRateLimit(ctx, ip); err != nil {
 			log.Printf("Warning: Failed to remove rate limit for disconnected IP %s: %v", ip, err)
@@ -287,65 +306,195 @@ func (s *QoSManager) monitorLoop(ctx context.Context, detectedIPs map[string]boo
 	// =========================================================
 	// 3. Collecte et Calcul des Statistiques
 	// =========================================================
-	
-	// Assertion de type pour accéder aux méthodes spécifiques au monitoring.
-	// Nous utilisons l'interface IPRateMonitor définie ci-dessus.
-	driverMonitor, ok := s.driver.(port.IPRateMonitor)
 
+	// Assertion de type pour accéder aux méthodes spécifiques au monitoring.
+	driverMonitor, ok := s.driver.(port.IPRateMonitor)
 	if !ok {
 		log.Println("Driver does not support advanced IP tracking methods (missing IPRateMonitor interface).")
 		return
 	}
 
-	// Maintenant, nous récupérons la map interne du driver: IP -> ClassID
+	// Construire la liste de toutes les IPs à envoyer au WebSocket
+	allIPs := make(map[string]bool)
+
+	s.ipMutex.RLock()
+	// Ajouter les IPs détectées (sans limite)
+	for ip := range s.detectedIPs {
+		allIPs[ip] = true
+	}
+	// Ajouter les IPs avec limite explicite (ont une classe HTB)
+	for ip := range s.activeIPLimits {
+		allIPs[ip] = true
+	}
+	s.ipMutex.RUnlock()
+
+	// Récupérer la map des IPs avec classe HTB active
 	driverIPs := driverMonitor.GetActiveIPs()
 
-	for ip, classID := range driverIPs {
-		// --- 3a. Calcul de l'Upload (WAN) ---
-		uploadStats, err := driverMonitor.GetInstantaneousClassStats(s.inet, classID)
-		uploadRateMbps := 0.0
-		if err == nil {
-			uploadRateMbps, _ = driverMonitor.CalculateIPRateMbps(ip, s.inet, classID, uploadStats)
-		} else {
-			log.Printf("Warning: Failed to read WAN stats for %s (1:%x): %v", ip, classID, err)
-		}
-
-		// --- 3b. Calcul du Download (LAN) ---
-		downloadStats, err := driverMonitor.GetInstantaneousClassStats(s.ilan, classID)
-		downloadRateMbps := 0.0
-		if err == nil {
-			downloadRateMbps, _ = driverMonitor.CalculateIPRateMbps(ip, s.ilan, classID, downloadStats)
-		} else {
-			log.Printf("Warning: Failed to read LAN stats for %s (1:%x): %v", ip, classID, err)
-		}
-		
-		// --- 4. Diffusion des résultats ---
-		// Vérifier si l'IP est activement limitée par une règle personnalisée (pas juste la règle par défaut du moniteur)
+	// Pour chaque IP détectée ou limitée, calculer et envoyer les stats
+	for ip := range allIPs {
+		var uploadRateMbps, downloadRateMbps float64
 		isLimited := false
-		
-		// Utilisation de RLock pour lire l'état de 'activeIPLimits' en toute sécurité.
-		s.ipMutex.RLock()
-		if _, ok := s.activeIPLimits[ip]; ok {
-			isLimited = true
-		}
-		s.ipMutex.RUnlock()
+		bandwidthLimit := ""
 
-		stat := domain.IPTrafficStat{
-			IP: ip,
-			UploadRate:   uploadRateMbps,
-			DownloadRate: downloadRateMbps,
-			IsLimited:    isLimited,
-			Status:       "Active", 
+		// Vérifier si cette IP a une classe HTB active (limite explicite)
+		if classID, hasClass := driverIPs[ip]; hasClass {
+			// IP avec classe HTB - lire les stats depuis HTB
+			uploadStats, err := driverMonitor.GetInstantaneousClassStats(s.inet, classID)
+			if err == nil {
+				uploadRateMbps, _ = driverMonitor.CalculateIPRateMbps(ip, s.inet, classID, uploadStats)
+			} else {
+				log.Printf("Warning: Failed to read WAN stats for %s (1:%x): %v", ip, classID, err)
+			}
+
+			downloadStats, err := driverMonitor.GetInstantaneousClassStats(s.ilan, classID)
+			if err == nil {
+				downloadRateMbps, _ = driverMonitor.CalculateIPRateMbps(ip, s.ilan, classID, downloadStats)
+			} else {
+				log.Printf("Warning: Failed to read LAN stats for %s (1:%x): %v", ip, classID, err)
+			}
+
+			// Récupérer la limite configurée
+			s.ipMutex.RLock()
+			if info, ok := s.activeIPLimits[ip]; ok {
+				isLimited = true
+				bandwidthLimit = info.Rule.Bandwidth
+			}
+			s.ipMutex.RUnlock()
+		} else {
+			// IP détectée mais sans classe HTB - sous limite globale uniquement
+			// Lire les stats depuis iptables counters
+			uploadBytes, downloadBytes, err := driverMonitor.GetIPTrafficBytes(ctx, ip, s.inet)
+			if err != nil {
+				log.Printf("Warning: Failed to read iptables counters for %s: %v", ip, err)
+				uploadRateMbps = 0.0
+				downloadRateMbps = 0.0
+			} else {
+				// Calculer le taux en Mbps à partir des compteurs
+				uploadRateMbps, _ = driverMonitor.CalculateIPTrafficRateFromIptables(ip, s.inet, uploadBytes, true)
+				downloadRateMbps, _ = driverMonitor.CalculateIPTrafficRateFromIptables(ip, s.ilan, downloadBytes, false)
+			}
+			isLimited = false
+			bandwidthLimit = "" // Vide = sous limite globale
 		}
 
-		// Envoi des statistiques au canal pour le consommateur WebSocket
+		ipStat := domain.IPTrafficStat{
+			IP:             ip,
+			UploadRate:     uploadRateMbps,
+			DownloadRate:   downloadRateMbps,
+			IsLimited:      isLimited,
+			BandwidthLimit: bandwidthLimit,
+			Status:         "Active",
+		}
+
+		// Envoi des statistiques IP au canal pour le consommateur WebSocket
+		update := domain.TrafficUpdate{
+			Type:   "ip",
+			IPStat: &ipStat,
+		}
 		select {
-		case s.statsStream <- stat:
+		case s.statsStream <- update:
 			// Sent successfully
 		default:
-			log.Println("Warning: Stats channel full, dropping data.")
+			log.Println("Warning: Stats channel full, dropping IP data.")
 		}
 	}
+
+	// =========================================================
+	// 4. Calcul et Envoi des Statistiques Globales
+	// =========================================================
+	s.sendGlobalStats(ctx)
+}
+
+// sendGlobalStats calcule et envoie les statistiques globales des interfaces
+func (s *QoSManager) sendGlobalStats(ctx context.Context) {
+	// Vérifier si le contexte est annulé
+	select {
+	case <-ctx.Done():
+		return
+	default:
+	}
+
+	// Utiliser s.driver directement pour les méthodes globales
+	globalDriver, ok := s.driver.(interface {
+		GetInstantaneousNetDevStats(iface string) (domain.NetDevStats, error)
+		CalculateRateMbps(iface string, currentStats domain.NetDevStats) (txRateMbps float64, rxRateMbps float64, err error)
+	})
+
+	if !ok {
+		log.Println("Warning: Driver does not support global stats methods")
+		return
+	}
+
+	// Statistiques LAN
+	lanStats, err := globalDriver.GetInstantaneousNetDevStats(s.ilan)
+	lanTxRate, lanRxRate := 0.0, 0.0
+	if err == nil {
+		lanTxRate, lanRxRate, _ = globalDriver.CalculateRateMbps(s.ilan, lanStats)
+	}
+
+	// Statistiques WAN
+	wanStats, err := globalDriver.GetInstantaneousNetDevStats(s.inet)
+	wanTxRate, wanRxRate := 0.0, 0.0
+	if err == nil {
+		wanTxRate, wanRxRate, _ = globalDriver.CalculateRateMbps(s.inet, wanStats)
+	}
+
+	// Compter les IPs actives et limitées
+	s.ipMutex.RLock()
+	totalActive := len(s.activeIPLimits)
+	totalLimited := 0
+	for _, info := range s.activeIPLimits {
+		// Si la bande passante n'est pas la valeur par défaut, on la considère comme limitée
+		if info.Rule.Bandwidth != DefaultIPRate {
+			totalLimited++
+		}
+	}
+	s.ipMutex.RUnlock()
+
+	globalStat := domain.GlobalTrafficStat{
+		LanInterface:    s.ilan,
+		WanInterface:    s.inet,
+		LanUploadRate:   lanTxRate,
+		LanDownloadRate: lanRxRate,
+		WanUploadRate:   wanTxRate,
+		WanDownloadRate: wanRxRate,
+		TotalActiveIPs:  totalActive,
+		TotalLimitedIPs: totalLimited,
+		Timestamp:       time.Now(),
+	}
+
+	update := domain.TrafficUpdate{
+		Type:       "global",
+		GlobalStat: &globalStat,
+	}
+
+	// Envoi avec respect du contexte
+	select {
+	case <-ctx.Done():
+		return
+	case s.statsStream <- update:
+		// Sent successfully
+	default:
+		log.Println("Warning: Stats channel full, dropping global data.")
+	}
+}
+
+// BlockDevice bloque un appareil en utilisant iptables pour empêcher l'accès à Internet
+func (s *QoSManager) BlockDevice(ctx context.Context, ip string) error {
+	log.Printf("QoSManager: Blocking device %s", ip)
+	return s.driver.BlockDevice(ctx, ip, s.inet)
+}
+
+// UnblockDevice débloque un appareil en supprimant les règles iptables
+func (s *QoSManager) UnblockDevice(ctx context.Context, ip string) error {
+	log.Printf("QoSManager: Unblocking device %s", ip)
+	return s.driver.UnblockDevice(ctx, ip, s.inet)
+}
+
+// IsDeviceBlocked vérifie si un appareil est actuellement bloqué
+func (s *QoSManager) IsDeviceBlocked(ctx context.Context, ip string) (bool, error) {
+	return s.driver.IsDeviceBlocked(ctx, ip, s.inet)
 }
 
 /* func() */
