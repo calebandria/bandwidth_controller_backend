@@ -171,9 +171,11 @@ func (s *BandwidthScheduler) addRuleToCron(rule domain.ScheduleRule) error {
 func (s *BandwidthScheduler) executeRule(rule domain.ScheduleRule) {
 	log.Printf("[Scheduler] Executing rule: %s (rate: %d Mbps, duration: %d min)", rule.Name, rule.RateMbps, rule.Duration)
 
-	// Appliquer la limite de bande passante
+	// Appliquer la limite de bande passante avec les interfaces du QoSManager
 	qosRule := domain.QoSRule{
-		Bandwidth: fmt.Sprintf("%dMbit", rule.RateMbps),
+		LanInterface: s.qos.GetLanInterface(),
+		WanInterface: s.qos.GetWanInterface(),
+		Bandwidth:    fmt.Sprintf("%dMbit", rule.RateMbps),
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

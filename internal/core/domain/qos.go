@@ -49,6 +49,7 @@ type GlobalTrafficStat struct {
 	WanDownloadRate float64   `json:"wan_download_rate_mbps" example:"45.9"` // Download depuis WAN (Rx sur WAN)
 	TotalActiveIPs  int       `json:"total_active_ips" example:"5"`
 	TotalLimitedIPs int       `json:"total_limited_ips" example:"3"`
+	GlobalLimit     string    `json:"global_limit" example:"100mbit"` // Current global bandwidth limit
 	Timestamp       time.Time `json:"timestamp"`
 }
 

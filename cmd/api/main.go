@@ -31,7 +31,7 @@ func main() {
 		return
 	}
 
-	globalRateLimit := "100"
+	globalRateLimit := "100mbit"
 
 	lanInterface := os.Args[1]
 	wanInterface := os.Args[2]

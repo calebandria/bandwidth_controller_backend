@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -148,7 +149,22 @@ func (l *LinuxDriver) SetupHTBStructure(ctx context.Context, ilan string, iwan s
 		if err := applyTcCommand(ctx, argsRootClass, iface); err != nil {
 			return fmt.Errorf("htb root class setup failed on %s: %w", iface, err)
 		}
-		log.Printf("HTB structure set up on %s with global capacity: %s (Root Class 1:1)", iface, totalBandwidth)
+
+		// 3. Add a leaf qdisc (fq_codel) to the root class so traffic actually flows through it
+		argsLeafQdisc := []string{"qdisc", "add", "dev", iface, "parent", "1:1", "handle", "10:", "fq_codel"}
+		if err := applyTcCommand(ctx, argsLeafQdisc, iface); err != nil {
+			return fmt.Errorf("htb leaf qdisc setup failed on %s: %w", iface, err)
+		}
+
+		// 4. Add a u32 classifier to force ALL traffic into root class 1:1 (prevents bypass)
+		// Use prio 10 (lower priority than per-IP fw filters which use prio 1)
+		argsClassifier := []string{"filter", "add", "dev", iface, "parent", "1:", "protocol", "ip",
+			"prio", "10", "u32", "match", "ip", "src", "0.0.0.0/0", "flowid", "1:1"}
+		if err := applyTcCommand(ctx, argsClassifier, iface); err != nil {
+			return fmt.Errorf("htb default classifier setup failed on %s: %w", iface, err)
+		}
+
+		log.Printf("HTB structure set up on %s with global capacity: %s (Root Class 1:1 + fq_codel + u32 classifier)", iface, totalBandwidth)
 		return nil
 	}
 
@@ -520,7 +536,11 @@ func (l *LinuxDriver) RemoveIPRateLimit(ctx context.Context, ip string, rule dom
 	iptablesTxArgs := []string{"-t", "mangle", "-D", "POSTROUTING", "-o", rule.WanInterface,
 		"-s", ip, "-j", "MARK", "--set-mark", markID}
 	if err := applyIptablesCommand(ctx, iptablesTxArgs); err != nil {
-		log.Printf("Warning: Failed to delete iptables Tx mark for %s: %v", ip, err)
+		log.Printf("Warning: Failed to delete iptables Tx mark for %s: %v (trying fallback)", ip, err)
+	}
+	// Always run fallback to ensure complete removal
+	if fbErr := deleteIptablesMatchingRule(ctx, "mangle", "POSTROUTING", rule.WanInterface, ip, markID, true); fbErr != nil {
+		log.Printf("Warning: Fallback deletion also failed for Tx mark %s: %v", ip, fbErr)
 	}
 
 	// --- PART 2: LAN (Download) Cleanup ---
@@ -541,7 +561,11 @@ func (l *LinuxDriver) RemoveIPRateLimit(ctx context.Context, ip string, rule dom
 	iptablesRxArgs := []string{"-t", "mangle", "-D", "POSTROUTING", "-o", rule.LanInterface,
 		"-d", ip, "-j", "MARK", "--set-mark", markID}
 	if err := applyIptablesCommand(ctx, iptablesRxArgs); err != nil {
-		log.Printf("Warning: Failed to delete iptables Rx mark for %s: %v", ip, err)
+		log.Printf("Warning: Failed to delete iptables Rx mark for %s: %v (trying fallback)", ip, err)
+	}
+	// Always run fallback to ensure complete removal
+	if fbErr := deleteIptablesMatchingRule(ctx, "mangle", "POSTROUTING", rule.LanInterface, ip, markID, false); fbErr != nil {
+		log.Printf("Warning: Fallback deletion also failed for Rx mark %s: %v", ip, fbErr)
 	}
 
 	// Ajouter le classID au pool de recyclage pour réutilisation future
@@ -549,6 +573,14 @@ func (l *LinuxDriver) RemoveIPRateLimit(ctx context.Context, ip string, rule dom
 	log.Printf("Recycling HTB Class ID %d (freed from IP %s) - Pool size: %d", classID, ip, len(l.freedClassIDs))
 
 	delete(l.activeIPs, ip)
+
+	// Re-create counting rules so the IP continues to be tracked under global limit
+	if err := l.EnsureIPCountingRules(ctx, ip, rule.LanInterface, rule.WanInterface); err != nil {
+		log.Printf("Warning: Failed to re-create counting rules for %s after removing limit: %v", ip, err)
+	} else {
+		log.Printf("IP %s is now back under global HTB limit with counting rules", ip)
+	}
+
 	log.Printf("IP QoS successfully removed for %s", ip)
 	return nil
 }
@@ -638,6 +670,67 @@ func (l *LinuxDriver) CalculateIPRateMbps(ip string, iface string, classID uint1
 	state.LastTime = currentTime
 
 	return rateMbps, nil
+}
+
+// deleteIptablesMatchingRule searches the given table/chain for rules that mention the IP and MARK
+// and deletes them by line number (deleting from highest index down to avoid reindex shifts).
+// if isTx=true it looks for source matches (-s), otherwise destination (-d).
+func deleteIptablesMatchingRule(ctx context.Context, table, chain, iface, ip, markID string, isTx bool) error {
+	// List the chain with line numbers
+	cmd := exec.CommandContext(ctx, "iptables", "-t", table, "-L", chain, "-n", "-v", "--line-numbers")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to list iptables %s %s: %w, output: %s", table, chain, err, string(out))
+	}
+
+	// Parse markID to hex for matching (iptables shows marks in hex like 0xa)
+	markInt, _ := strconv.ParseUint(markID, 10, 32)
+	markHex := fmt.Sprintf("0x%x", markInt)
+
+	lines := strings.Split(string(out), "\n")
+	// Collect matching line numbers
+	var toDelete []int
+	for _, line := range lines {
+		// Must contain IP and MARK target
+		if !strings.Contains(line, ip) || !strings.Contains(line, "MARK") {
+			continue
+		}
+
+		// Check if the mark value matches (try both hex and set-mark formats)
+		// iptables -L shows marks as "0xa" but also shows "set 0xa" in some formats
+		hasMarkHex := strings.Contains(line, markHex) || strings.Contains(line, "set "+markHex)
+		hasMarkDec := strings.Contains(line, "set "+markID) || strings.Contains(line, "mark "+markID)
+
+		if !hasMarkHex && !hasMarkDec {
+			continue
+		}
+
+		// line starts with number in first column
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		if num, err := strconv.Atoi(fields[0]); err == nil {
+			toDelete = append(toDelete, num)
+		}
+	}
+
+	if len(toDelete) == 0 {
+		// nothing found
+		return fmt.Errorf("no matching iptables rules found for %s (mark %s/%s) in %s/%s", ip, markID, markHex, table, chain)
+	}
+
+	// Delete from highest to lowest to avoid index shifts
+	sort.Ints(toDelete)
+	for i := len(toDelete) - 1; i >= 0; i-- {
+		ln := toDelete[i]
+		delCmd := exec.CommandContext(ctx, "iptables", "-t", table, "-D", chain, fmt.Sprintf("%d", ln))
+		if out, err := delCmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to delete iptables rule %d in %s %s: %w, output: %s", ln, table, chain, err, string(out))
+		}
+		log.Printf("Deleted iptables rule line %d from %s %s (IP: %s, mark: %s)", ln, table, chain, ip, markHex)
+	}
+	return nil
 }
 
 // CalculateIPTrafficRateFromIptables calcule le taux de transfert en Mbps à partir des compteurs iptables

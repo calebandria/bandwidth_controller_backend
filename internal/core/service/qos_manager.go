@@ -36,6 +36,7 @@ type QoSManager struct {
 	ilan             string
 	inet             string
 	activeMode       string
+	globalLimit      string // Current global bandwidth limit (e.g., "100mbit")
 	globalSetupMutex sync.Mutex
 
 	// Suivi des IPs actuellement limitées (et donc avec une classe HTB).
@@ -53,6 +54,7 @@ func NewQoSManager(driver port.NetworkDriver, ilan string, inet string) *QoSMana
 		ilan:           ilan,
 		inet:           inet,
 		activeMode:     ModeGlobalTBF,
+		globalLimit:    "0", // Will be set during SetupGlobalQoS
 		activeIPLimits: make(map[string]IPTrackingInfo),
 		detectedIPs:    make(map[string]time.Time),
 	}
@@ -63,6 +65,9 @@ func (s *QoSManager) SetupGlobalQoS(ctx context.Context, ilan string, inet strin
 	if err := s.driver.SetupHTBStructure(ctx, ilan, inet, maxRate); err != nil {
 		return err
 	}
+	s.globalSetupMutex.Lock()
+	s.globalLimit = maxRate
+	s.globalSetupMutex.Unlock()
 	s.activeMode = ModeGlobalHTB
 	return nil
 }
@@ -80,6 +85,7 @@ func (s *QoSManager) UpdateGlobalLimit(ctx context.Context, rule domain.QoSRule)
 				return fmt.Errorf("failed to auto-initialize HTB structure: %w", err)
 			}
 			s.activeMode = ModeGlobalHTB
+			s.globalLimit = rule.Bandwidth // Store the limit
 			log.Println("HTB structure auto-initialized successfully")
 			// Pas besoin d'appeler ApplyGlobalShaping car SetupHTBStructure a déjà configuré la bande passante
 			return nil
@@ -89,6 +95,12 @@ func (s *QoSManager) UpdateGlobalLimit(ctx context.Context, rule domain.QoSRule)
 	if s.activeMode != ModeGlobalHTB {
 		return errors.New("HTB mode is not active. Please call /qos/setup first")
 	}
+
+	// Update the stored global limit
+	s.globalSetupMutex.Lock()
+	s.globalLimit = rule.Bandwidth
+	s.globalSetupMutex.Unlock()
+
 	return s.driver.ApplyGlobalShaping(ctx, rule)
 }
 
@@ -452,6 +464,10 @@ func (s *QoSManager) sendGlobalStats(ctx context.Context) {
 	}
 	s.ipMutex.RUnlock()
 
+	s.globalSetupMutex.Lock()
+	currentGlobalLimit := s.globalLimit
+	s.globalSetupMutex.Unlock()
+
 	globalStat := domain.GlobalTrafficStat{
 		LanInterface:    s.ilan,
 		WanInterface:    s.inet,
@@ -461,6 +477,7 @@ func (s *QoSManager) sendGlobalStats(ctx context.Context) {
 		WanDownloadRate: wanRxRate,
 		TotalActiveIPs:  totalActive,
 		TotalLimitedIPs: totalLimited,
+		GlobalLimit:     currentGlobalLimit,
 		Timestamp:       time.Now(),
 	}
 
@@ -495,6 +512,16 @@ func (s *QoSManager) UnblockDevice(ctx context.Context, ip string) error {
 // IsDeviceBlocked vérifie si un appareil est actuellement bloqué
 func (s *QoSManager) IsDeviceBlocked(ctx context.Context, ip string) (bool, error) {
 	return s.driver.IsDeviceBlocked(ctx, ip, s.inet)
+}
+
+// GetLanInterface returns the LAN interface name
+func (s *QoSManager) GetLanInterface() string {
+	return s.ilan
+}
+
+// GetWanInterface returns the WAN interface name
+func (s *QoSManager) GetWanInterface() string {
+	return s.inet
 }
 
 /* func() */
