@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 type AuthServiceImpl struct {
@@ -33,8 +35,9 @@ func (s *AuthServiceImpl) Login(username, password string) (*domain.LoginRespons
 		return nil, errors.New("invalid credentials")
 	}
 
-	// Verify password (in production, use bcrypt.CompareHashAndPassword)
-	if user.Password != password {
+	// Verify password using bcrypt
+	// user.Password contains the bcrypt hash from database (password_hash column)
+	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(password)); err != nil {
 		return nil, errors.New("invalid credentials")
 	}
 

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/joho/godotenv"
 
 	swaggerFiles "github.com/swaggo/files"
 	ginSwagger "github.com/swaggo/gin-swagger"
@@ -17,6 +18,7 @@ import (
 	"bandwidth_controller_backend/internal/adapter/handler"
 	adapter "bandwidth_controller_backend/internal/adapter/repository"
 	"bandwidth_controller_backend/internal/adapter/system"
+	"bandwidth_controller_backend/internal/config"
 	"bandwidth_controller_backend/internal/core/service"
 )
 
@@ -26,6 +28,11 @@ import (
 // @host localhost:8080
 // @BasePath /
 func main() {
+	// Load .env file
+	if err := godotenv.Load(); err != nil {
+		log.Println("Warning: .env file not found, using environment variables or defaults")
+	}
+
 	if len(os.Args) < 3 {
 		fmt.Println("Please provide the Lan and Wan interfaces in that order.")
 		return
@@ -70,23 +77,44 @@ func main() {
 	bandwidthScheduler.Start()
 	log.Println("Bandwidth scheduler initialized")
 
-	// 3. Initialiser le Handler
-	qosHandler := handler.NewNetworkHandler(qosService, networkDriver, lanInterface, wanInterface)
-
-	// 4. Initialize Auth Service and Handler
-	authRepo := adapter.NewInMemoryAuthRepository()
-	authService := service.NewAuthService(authRepo)
-	authHandler := handler.NewAuthHandler(authService)
-
+	// 3. Clean up interfaces before setup
 	log.Printf("Cleaning up interface %s and %s on startup...", wanInterface, lanInterface)
-
 	if err := networkDriver.ResetShaping(cleanupCtx, lanInterface, wanInterface); err != nil {
 		log.Printf("Warning: Could not clean up existing QoS rules (may be normal if none exist): %v", err)
 	} else {
 		log.Println("Interface cleaned successfully.")
 	}
 
-	// --- Configuration des Routes Gin ---
+	// 4. Initialize Network Handler
+	qosHandler := handler.NewNetworkHandler(qosService, networkDriver, lanInterface, wanInterface)
+
+	// 5. Initialize Database Connection
+	dbConfig := config.GetDatabaseConfig()
+	db, err := config.ConnectDatabase(dbConfig)
+
+	var authHandler *handler.AuthHandler
+	if err != nil {
+		log.Printf("Warning: Could not connect to PostgreSQL: %v", err)
+		log.Println("Falling back to in-memory auth repository")
+		authRepo := adapter.NewInMemoryAuthRepository()
+		authService := service.NewAuthService(authRepo)
+		authHandler = handler.NewAuthHandler(authService)
+	} else {
+		log.Println("PostgreSQL connection successful")
+		authRepo := adapter.NewPostgresAuthRepository(db)
+		authService := service.NewAuthService(authRepo)
+		authHandler = handler.NewAuthHandler(authService)
+	}
+
+	// 6. Setup Routes
+	setupRoutes(qosHandler, authHandler, bandwidthScheduler)
+
+	port := "8080"
+	log.Printf("Server listening on port %s...", port)
+}
+
+// setupRoutes configures all HTTP routes
+func setupRoutes(qosHandler *handler.NetworkHandler, authHandler *handler.AuthHandler, bandwidthScheduler *service.BandwidthScheduler) *gin.Engine {
 	r := gin.Default()
 
 	// CORS Middleware for frontend
@@ -126,23 +154,26 @@ func main() {
 	protected.POST("/qos/ip/limit", qosHandler.AddIPRateLimitHandler)
 	protected.POST("/qos/ip/remove", qosHandler.RemoveIPRateLimitHandler)
 
-	// Routes de Contrôle de Devices (Blocage/Déblocage)
+	// Routes de Monitoring (WebSocket et HTTP)
+	protected.GET("/qos/stats", qosHandler.GetTrafficStatsHandler)
+	protected.GET("/qos/stream", qosHandler.StreamTrafficStatsHandler)
+	protected.GET("/status/lanips", qosHandler.GetConnectedLANIPsHandler)
+	log.Println("Monitoring routes initialized")
+
+	// Routes de Device Control (Block/Unblock)
 	protected.POST("/qos/device/block", qosHandler.BlockDeviceHandler)
 	protected.POST("/qos/device/unblock", qosHandler.UnblockDeviceHandler)
 	protected.GET("/qos/device/status", qosHandler.GetDeviceStatusHandler)
-
-	// Routes de Statut et Monitoring
-	protected.GET("/status/lanips", qosHandler.GetConnectedLANIPsHandler)
-	protected.GET("/qos/stats", qosHandler.GetTrafficStatsHandler)
-	protected.GET("/qos/stream", qosHandler.StreamTrafficStatsHandler)
+	log.Println("Device control routes initialized")
 
 	// Routes de Scheduling
 	handler.RegisterScheduleRoutes(r, bandwidthScheduler)
 	log.Println("Bandwidth scheduling routes initialized")
 
-	port := "8080"
-	log.Printf("Server listening on port %s...", port)
-	if err := http.ListenAndServe(":"+port, r); err != nil {
+	// Start HTTP Server
+	if err := http.ListenAndServe(":8080", r); err != nil {
 		log.Fatalf("Server failed to start: %v", err)
 	}
+
+	return r
 }

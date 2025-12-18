@@ -1,0 +1,12 @@
+package main
+
+import (
+  "fmt"
+  "golang.org/x/crypto/bcrypt"
+)
+
+func main() {
+  pw := "TsaraNyAndro"
+  h, _ := bcrypt.GenerateFromPassword([]byte(pw), bcrypt.DefaultCost)
+  fmt.Printf("INSERT INTO users (username, password_hash, role, created_at) VALUES ('kaleba', '%s', 'admin', now());\n", h)
+}

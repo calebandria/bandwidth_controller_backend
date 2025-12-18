@@ -4,10 +4,13 @@ import "time"
 
 // User represents a user in the system
 type User struct {
-	Username string `json:"username"`
-	Password string `json:"-"` // Never expose password in JSON
-	Role     string `json:"role"`
-	Name     string `json:"name"`
+	ID        int       `json:"id" db:"id"`
+	Username  string    `json:"username" db:"username"`
+	Password  string    `json:"-" db:"password_hash"` // Never expose password in JSON
+	Role      string    `json:"role" db:"role"`
+	Name      string    `json:"name" db:"name"`
+	CreatedAt time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt time.Time `json:"updated_at" db:"updated_at"`
 }
 
 // LoginRequest represents the login credentials
