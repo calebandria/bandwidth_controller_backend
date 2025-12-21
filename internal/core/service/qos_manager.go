@@ -30,15 +30,16 @@ type IPTrackingInfo struct {
 // Ces méthodes sont celles que le service *suppose* être implémentées par le driver.
 
 type QoSManager struct {
-	driver           port.NetworkDriver
-	deviceRepo       port.DeviceRepository
-	statsStream      chan domain.TrafficUpdate // Canal pour envoyer les statistiques IP et globales
-	threshold        uint64
-	ilan             string
-	inet             string
-	activeMode       string
-	globalLimit      string // Current global bandwidth limit (e.g., "100mbit")
-	globalSetupMutex sync.Mutex
+	driver             port.NetworkDriver
+	deviceRepo         port.DeviceRepository
+	trafficHistoryRepo port.TrafficHistoryRepository
+	statsStream        chan domain.TrafficUpdate // Canal pour envoyer les statistiques IP et globales
+	threshold          uint64
+	ilan               string
+	inet               string
+	activeMode         string
+	globalLimit        string // Current global bandwidth limit (e.g., "100mbit")
+	globalSetupMutex   sync.Mutex
 
 	// Suivi des IPs actuellement limitées (et donc avec une classe HTB).
 	activeIPLimits map[string]IPTrackingInfo
@@ -53,20 +54,21 @@ type QoSManager struct {
 	sequenceMutex sync.Mutex
 }
 
-func NewQoSManager(driver port.NetworkDriver, deviceRepo port.DeviceRepository, ilan string, inet string) *QoSManager {
+func NewQoSManager(driver port.NetworkDriver, deviceRepo port.DeviceRepository, trafficHistoryRepo port.TrafficHistoryRepository, ilan string, inet string) *QoSManager {
 	mgr := &QoSManager{
-		driver:         driver,
-		deviceRepo:     deviceRepo,
-		statsStream:    make(chan domain.TrafficUpdate, 100),
-		threshold:      100000000,
-		ilan:           ilan,
-		inet:           inet,
-		activeMode:     ModeGlobalTBF,
-		globalLimit:    "0", // Will be set during SetupGlobalQoS
-		activeIPLimits: make(map[string]IPTrackingInfo),
-		detectedIPs:    make(map[string]time.Time),
-		lastKnownMAC:   make(map[string]string),
-		stateSequence:  0,
+		driver:             driver,
+		deviceRepo:         deviceRepo,
+		trafficHistoryRepo: trafficHistoryRepo,
+		statsStream:        make(chan domain.TrafficUpdate, 100),
+		threshold:          100000000,
+		ilan:               ilan,
+		inet:               inet,
+		activeMode:         ModeGlobalTBF,
+		globalLimit:        "0", // Will be set during SetupGlobalQoS
+		activeIPLimits:     make(map[string]IPTrackingInfo),
+		detectedIPs:        make(map[string]time.Time),
+		lastKnownMAC:       make(map[string]string),
+		stateSequence:      0,
 	}
 	return mgr
 }
@@ -455,6 +457,9 @@ func (s *QoSManager) monitorLoop(ctx context.Context, detectedIPs map[string]boo
 	// Récupérer la map des IPs avec classe HTB active
 	driverIPs := driverMonitor.GetActiveIPs()
 
+	// Collect all IP stats for history saving
+	var allIPStats []domain.IPTrafficStat
+
 	// Pour chaque IP détectée ou limitée, calculer et envoyer les stats
 	for ip := range allIPs {
 		var uploadRateMbps, downloadRateMbps float64
@@ -528,6 +533,9 @@ func (s *QoSManager) monitorLoop(ctx context.Context, detectedIPs map[string]boo
 			Status:         "Active",
 		}
 
+		// Store for history saving
+		allIPStats = append(allIPStats, ipStat)
+
 		// Envoi des statistiques IP au canal pour le consommateur WebSocket
 		update := domain.TrafficUpdate{
 			Type:   "ip",
@@ -544,15 +552,27 @@ func (s *QoSManager) monitorLoop(ctx context.Context, detectedIPs map[string]boo
 	// =========================================================
 	// 4. Calcul et Envoi des Statistiques Globales
 	// =========================================================
-	s.sendGlobalStats(ctx)
+	globalStat := s.sendGlobalStats(ctx)
+
+	// =========================================================
+	// 5. Save Traffic History (async)
+	// =========================================================
+	if s.trafficHistoryRepo != nil && globalStat != nil {
+		go func() {
+			historyCtx := context.Background() // Use background context to prevent cancellation
+			if err := s.SaveTrafficSnapshot(historyCtx, globalStat, allIPStats); err != nil {
+				log.Printf("Failed to save traffic history: %v", err)
+			}
+		}()
+	}
 }
 
 // sendGlobalStats calcule et envoie les statistiques globales des interfaces
-func (s *QoSManager) sendGlobalStats(ctx context.Context) {
+func (s *QoSManager) sendGlobalStats(ctx context.Context) *domain.GlobalTrafficStat {
 	// Vérifier si le contexte est annulé
 	select {
 	case <-ctx.Done():
-		return
+		return nil
 	default:
 	}
 
@@ -564,7 +584,7 @@ func (s *QoSManager) sendGlobalStats(ctx context.Context) {
 
 	if !ok {
 		log.Println("Warning: Driver does not support global stats methods")
-		return
+		return nil
 	}
 
 	// Statistiques LAN
@@ -618,12 +638,14 @@ func (s *QoSManager) sendGlobalStats(ctx context.Context) {
 	// Envoi avec respect du contexte
 	select {
 	case <-ctx.Done():
-		return
+		return &globalStat
 	case s.statsStream <- update:
 		// Sent successfully
 	default:
 		log.Println("Warning: Stats channel full, dropping global data.")
 	}
+
+	return &globalStat
 }
 
 // BlockDevice bloque un appareil en utilisant iptables pour empêcher l'accès à Internet
@@ -698,6 +720,64 @@ func (s *QoSManager) CurrentIPSnapshot() IPSnapshot {
 		Timestamp: time.Now(),
 		IPs:       ips,
 	}
+}
+
+// SaveTrafficSnapshot saves current traffic stats to history database
+func (s *QoSManager) SaveTrafficSnapshot(ctx context.Context, globalStat *domain.GlobalTrafficStat, ipStats []domain.IPTrafficStat) error {
+	if s.trafficHistoryRepo == nil {
+		return nil // History tracking disabled
+	}
+
+	timestamp := time.Now()
+
+	// Save global traffic history
+	if globalStat != nil {
+		historyEntry := &domain.TrafficHistoryEntry{
+			Timestamp:       timestamp,
+			LanUploadRate:   globalStat.LanUploadRate,
+			LanDownloadRate: globalStat.LanDownloadRate,
+			WanUploadRate:   globalStat.WanUploadRate,
+			WanDownloadRate: globalStat.WanDownloadRate,
+			IPStats:         make([]domain.IPTrafficHistoryStat, 0, len(ipStats)),
+		}
+
+		// Add simplified IP stats for JSONB storage
+		for _, ipStat := range ipStats {
+			historyEntry.IPStats = append(historyEntry.IPStats, domain.IPTrafficHistoryStat{
+				IP:           ipStat.IP,
+				UploadRate:   ipStat.UploadRate,
+				DownloadRate: ipStat.DownloadRate,
+				MACAddress:   ipStat.MACAddress,
+			})
+		}
+
+		if err := s.trafficHistoryRepo.SaveGlobalTraffic(ctx, historyEntry); err != nil {
+			log.Printf("Failed to save global traffic history: %v", err)
+			// Don't return error, just log it
+		}
+	}
+
+	// Save per-IP traffic history
+	if len(ipStats) > 0 {
+		ipEntries := make([]*domain.IPTrafficHistoryEntry, 0, len(ipStats))
+		for _, ipStat := range ipStats {
+			ipEntries = append(ipEntries, &domain.IPTrafficHistoryEntry{
+				Timestamp:      timestamp,
+				IP:             ipStat.IP,
+				MACAddress:     ipStat.MACAddress,
+				Hostname:       ipStat.Hostname,
+				UploadRate:     ipStat.UploadRate,
+				DownloadRate:   ipStat.DownloadRate,
+				BandwidthLimit: ipStat.BandwidthLimit,
+			})
+		}
+
+		if err := s.trafficHistoryRepo.SaveIPTraffic(ctx, ipEntries); err != nil {
+			log.Printf("Failed to save IP traffic history: %v", err)
+		}
+	}
+
+	return nil
 }
 
 /* func() */

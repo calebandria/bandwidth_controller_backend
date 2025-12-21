@@ -73,22 +73,30 @@ func main() {
 
 	// Initialize device repository
 	var deviceRepo port.DeviceRepository
+	var trafficHistoryRepo port.TrafficHistoryRepository
 	if err != nil {
 		log.Printf("Warning: Could not connect to PostgreSQL: %v", err)
 		log.Println("Device persistence disabled (no database)")
 		deviceRepo = nil // QoSManager will handle nil gracefully
+		trafficHistoryRepo = nil
 	} else {
 		log.Println("PostgreSQL connection successful")
 		deviceRepo = adapter.NewPostgresDeviceRepository(db)
+		trafficHistoryRepo = adapter.NewPostgresTrafficHistoryRepository(db)
 
 		// Run device table migration
 		if err := runDeviceMigration(db); err != nil {
 			log.Printf("Warning: Device migration failed: %v", err)
 		}
+
+		// Run traffic history migration
+		if err := runTrafficHistoryMigration(db); err != nil {
+			log.Printf("Warning: Traffic history migration failed: %v", err)
+		}
 	}
 
 	// 5. Create QoSManager with device repository from the start
-	qosService := service.NewQoSManager(networkDriver, deviceRepo, lanInterface, wanInterface)
+	qosService := service.NewQoSManager(networkDriver, deviceRepo, trafficHistoryRepo, lanInterface, wanInterface)
 
 	if err := qosService.SetupGlobalQoS(cleanupCtx, lanInterface, wanInterface, globalRateLimit); err != nil {
 		log.Fatalf("Fatal Error: Could not start default global HTB QoS: %v. Exiting.", err)
@@ -121,7 +129,7 @@ func main() {
 	}
 
 	// 8. Initialize Network Handler (AFTER QoSManager has device repo)
-	qosHandler := handler.NewNetworkHandler(qosService, networkDriver, lanInterface, wanInterface)
+	qosHandler := handler.NewNetworkHandler(qosService, networkDriver, trafficHistoryRepo, lanInterface, wanInterface)
 
 	// 9. Setup Routes
 	setupRoutes(qosHandler, authHandler, bandwidthScheduler)
@@ -155,6 +163,59 @@ func runDeviceMigration(db *sql.DB) error {
 	}
 
 	log.Println("Devices table migration completed")
+	return nil
+}
+
+// runTrafficHistoryMigration creates the traffic history tables if they don't exist
+func runTrafficHistoryMigration(db *sql.DB) error {
+	migrationSQL := `
+	-- Create traffic history table for storing historical bandwidth data
+	CREATE TABLE IF NOT EXISTS traffic_history (
+		id BIGSERIAL PRIMARY KEY,
+		timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		
+		-- Global traffic stats
+		lan_upload_rate DECIMAL(10, 4),      -- Mbps
+		lan_download_rate DECIMAL(10, 4),    -- Mbps
+		wan_upload_rate DECIMAL(10, 4),      -- Mbps
+		wan_download_rate DECIMAL(10, 4),    -- Mbps
+		
+		-- Per-IP traffic stats (aggregated)
+		ip_stats JSONB,                      -- Array of {ip, upload_rate, download_rate, mac_address}
+		
+		created_at TIMESTAMPTZ DEFAULT NOW()
+	);
+
+	-- Create index on timestamp for efficient time-range queries
+	CREATE INDEX IF NOT EXISTS idx_traffic_history_timestamp ON traffic_history(timestamp DESC);
+	CREATE INDEX IF NOT EXISTS idx_traffic_history_created_at ON traffic_history(created_at);
+
+	-- Create a separate table for detailed IP traffic history
+	CREATE TABLE IF NOT EXISTS ip_traffic_history (
+		id BIGSERIAL PRIMARY KEY,
+		timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		ip VARCHAR(45) NOT NULL,              -- IPv4 or IPv6
+		mac_address VARCHAR(17),              -- MAC address
+		hostname VARCHAR(255),                -- Device hostname
+		upload_rate DECIMAL(10, 4),           -- Mbps
+		download_rate DECIMAL(10, 4),         -- Mbps
+		bandwidth_limit VARCHAR(20),          -- e.g., "25mbit"
+		
+		created_at TIMESTAMPTZ DEFAULT NOW()
+	);
+
+	-- Create indexes for efficient queries
+	CREATE INDEX IF NOT EXISTS idx_ip_traffic_timestamp ON ip_traffic_history(timestamp DESC);
+	CREATE INDEX IF NOT EXISTS idx_ip_traffic_ip ON ip_traffic_history(ip);
+	CREATE INDEX IF NOT EXISTS idx_ip_traffic_ip_timestamp ON ip_traffic_history(ip, timestamp DESC);
+	`
+
+	_, err := db.Exec(migrationSQL)
+	if err != nil {
+		return fmt.Errorf("failed to create traffic history tables: %w", err)
+	}
+
+	log.Println("Traffic history tables migration completed")
 	return nil
 }
 
@@ -211,6 +272,12 @@ func setupRoutes(qosHandler *handler.NetworkHandler, authHandler *handler.AuthHa
 	protected.POST("/qos/device/unblock", qosHandler.UnblockDeviceHandler)
 	protected.GET("/qos/device/status", qosHandler.GetDeviceStatusHandler)
 	log.Println("Device control routes initialized")
+
+	// Routes de Traffic History
+	protected.GET("/traffic/history/global", qosHandler.GetGlobalTrafficHistoryHandler)
+	protected.GET("/traffic/history/ip", qosHandler.GetIPTrafficHistoryHandler)
+	protected.GET("/traffic/history/top-consumers", qosHandler.GetTopConsumersHandler)
+	log.Println("Traffic history routes initialized")
 
 	// Routes de Scheduling
 	handler.RegisterScheduleRoutes(r, bandwidthScheduler)

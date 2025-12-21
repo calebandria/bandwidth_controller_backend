@@ -51,11 +51,12 @@ type InterfaceStats struct {
 // --- Handler Structure ---
 
 type NetworkHandler struct {
-	svc          port.QoSService
-	netDriver    port.NetworkDriver
-	upgrader     websocket.Upgrader
-	lanInterface string
-	wanInterface string
+	svc                port.QoSService
+	netDriver          port.NetworkDriver
+	trafficHistoryRepo port.TrafficHistoryRepository
+	upgrader           websocket.Upgrader
+	lanInterface       string
+	wanInterface       string
 }
 
 type ScheduleEntry struct {
@@ -74,10 +75,11 @@ type ScheduledIPControlRequest struct {
 	ScheduleEntry
 }
 
-func NewNetworkHandler(svc port.QoSService, netDriver port.NetworkDriver, ilan string, inet string) *NetworkHandler {
+func NewNetworkHandler(svc port.QoSService, netDriver port.NetworkDriver, trafficHistoryRepo port.TrafficHistoryRepository, ilan string, inet string) *NetworkHandler {
 	return &NetworkHandler{
-		svc:       svc,
-		netDriver: netDriver,
+		svc:                svc,
+		netDriver:          netDriver,
+		trafficHistoryRepo: trafficHistoryRepo,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
@@ -568,4 +570,139 @@ func (h *NetworkHandler) GetDeviceStatusHandler(c *gin.Context) {
 		"ip":      ip,
 		"blocked": blocked,
 	})
+}
+
+// GetGlobalTrafficHistoryHandler
+// @Summary Get global traffic history for a time range
+// @Description Retrieves historical global traffic data (LAN/WAN upload/download rates)
+// @Tags Traffic History
+// @Accept json
+// @Produce json
+// @Param start_time query string true "Start time (RFC3339)" example:"2025-12-21T00:00:00Z"
+// @Param end_time query string true "End time (RFC3339)" example:"2025-12-21T23:59:59Z"
+// @Param interval query string false "Aggregation interval (e.g., '5m', '1h', 'raw')" example:"5m"
+// @Success 200 {array} domain.TrafficHistoryEntry
+// @Failure 400 {object} map[string]string "error: Invalid parameters"
+// @Failure 500 {object} map[string]string "error: Failed to retrieve history"
+// @Router /traffic/history/global [get]
+func (h *NetworkHandler) GetGlobalTrafficHistoryHandler(c *gin.Context) {
+	startTimeStr := c.Query("start_time")
+	endTimeStr := c.Query("end_time")
+	interval := c.DefaultQuery("interval", "raw")
+
+	if startTimeStr == "" || endTimeStr == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "start_time and end_time are required"})
+		return
+	}
+
+	startTime, err := time.Parse(time.RFC3339, startTimeStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid start_time format (use RFC3339)"})
+		return
+	}
+
+	endTime, err := time.Parse(time.RFC3339, endTimeStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid end_time format (use RFC3339)"})
+		return
+	}
+
+	history, err := h.trafficHistoryRepo.GetGlobalTrafficHistory(c.Request.Context(), startTime, endTime, interval)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve traffic history: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, history)
+}
+
+// GetIPTrafficHistoryHandler
+// @Summary Get traffic history for a specific IP
+// @Description Retrieves historical traffic data for a specific IP address
+// @Tags Traffic History
+// @Accept json
+// @Produce json
+// @Param ip query string true "IP address" example:"192.168.1.10"
+// @Param start_time query string true "Start time (RFC3339)" example:"2025-12-21T00:00:00Z"
+// @Param end_time query string true "End time (RFC3339)" example:"2025-12-21T23:59:59Z"
+// @Success 200 {array} domain.IPTrafficHistoryEntry
+// @Failure 400 {object} map[string]string "error: Invalid parameters"
+// @Failure 500 {object} map[string]string "error: Failed to retrieve history"
+// @Router /traffic/history/ip [get]
+func (h *NetworkHandler) GetIPTrafficHistoryHandler(c *gin.Context) {
+	ip := c.Query("ip")
+	startTimeStr := c.Query("start_time")
+	endTimeStr := c.Query("end_time")
+
+	if ip == "" || startTimeStr == "" || endTimeStr == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "ip, start_time, and end_time are required"})
+		return
+	}
+
+	startTime, err := time.Parse(time.RFC3339, startTimeStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid start_time format (use RFC3339)"})
+		return
+	}
+
+	endTime, err := time.Parse(time.RFC3339, endTimeStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid end_time format (use RFC3339)"})
+		return
+	}
+
+	history, err := h.trafficHistoryRepo.GetIPTrafficHistory(c.Request.Context(), ip, startTime, endTime)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve IP traffic history: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, history)
+}
+
+// GetTopConsumersHandler
+// @Summary Get top data consumers
+// @Description Returns the top N IPs by total traffic consumption
+// @Tags Traffic History
+// @Accept json
+// @Produce json
+// @Param start_time query string true "Start time (RFC3339)" example:"2025-12-21T00:00:00Z"
+// @Param end_time query string true "End time (RFC3339)" example:"2025-12-21T23:59:59Z"
+// @Param limit query int false "Number of top consumers to return" default:10
+// @Success 200 {array} domain.TopConsumer
+// @Failure 400 {object} map[string]string "error: Invalid parameters"
+// @Failure 500 {object} map[string]string "error: Failed to retrieve top consumers"
+// @Router /traffic/history/top-consumers [get]
+func (h *NetworkHandler) GetTopConsumersHandler(c *gin.Context) {
+	startTimeStr := c.Query("start_time")
+	endTimeStr := c.Query("end_time")
+	limit := 10
+	if limitStr := c.Query("limit"); limitStr != "" {
+		fmt.Sscanf(limitStr, "%d", &limit)
+	}
+
+	if startTimeStr == "" || endTimeStr == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "start_time and end_time are required"})
+		return
+	}
+
+	startTime, err := time.Parse(time.RFC3339, startTimeStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid start_time format (use RFC3339)"})
+		return
+	}
+
+	endTime, err := time.Parse(time.RFC3339, endTimeStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid end_time format (use RFC3339)"})
+		return
+	}
+
+	topConsumers, err := h.trafficHistoryRepo.GetTopConsumers(c.Request.Context(), startTime, endTime, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve top consumers: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, topConsumers)
 }
