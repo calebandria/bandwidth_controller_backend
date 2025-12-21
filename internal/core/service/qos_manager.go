@@ -178,7 +178,7 @@ func (s *QoSManager) AddIPRateLimit(ctx context.Context, ip string, rule domain.
 	}
 
 	s.ipMutex.Lock()
-	defer s.ipMutex.Unlock()
+	// Note: We unlock manually before sending to channel to avoid deadlock
 
 	// Vérifier si la règle existe déjà pour cette IP
 	if info, ok := s.activeIPLimits[ip]; ok {
@@ -204,11 +204,13 @@ func (s *QoSManager) AddIPRateLimit(ctx context.Context, ip string, rule domain.
 	// Increment sequence on state change
 	s.incrementSequence()
 
-	// Immediately broadcast the change to WebSocket clients
-	s.ipMutex.RLock()
+	// Get MAC address while we still have the lock
 	mac := s.lastKnownMAC[ip]
-	s.ipMutex.RUnlock()
 
+	// Release the lock BEFORE sending to channel to avoid deadlock
+	s.ipMutex.Unlock()
+
+	// Immediately broadcast the change to WebSocket clients
 	ipStat := domain.IPTrafficStat{
 		IP:             ip,
 		MACAddress:     mac,
@@ -222,16 +224,26 @@ func (s *QoSManager) AddIPRateLimit(ctx context.Context, ip string, rule domain.
 		Type:   "ip",
 		IPStat: &ipStat,
 	}
+
+	// Try to send update without blocking
 	select {
 	case s.statsStream <- update:
-		// Sent successfully
+		log.Printf("Broadcasted IP limit update for %s via WebSocket", ip)
 	default:
-		// Channel full, will be updated on next monitoring cycle
+		log.Printf("Warning: Stats channel full, IP limit update for %s will be sent on next monitoring cycle", ip)
 	}
 
-	// Persist to database (async to avoid blocking)
-	// Use background context to prevent cancellation when HTTP request finishes
-	go s.persistIPLimit(context.Background(), ip, rule.Bandwidth)
+	// Persist to database (async to avoid blocking the HTTP response)
+	if s.deviceRepo != nil {
+		go func() {
+			bgCtx := context.Background()
+			if err := s.deviceRepo.UpdateLimit(bgCtx, ip, &rule.Bandwidth); err != nil {
+				log.Printf("Failed to persist IP limit to database for %s: %v", ip, err)
+			} else {
+				log.Printf("IP limit for %s persisted to database: %s", ip, rule.Bandwidth)
+			}
+		}()
+	}
 
 	log.Printf("IP %s successfully added to rate limits.", ip)
 	return nil
@@ -282,13 +294,14 @@ func (s *QoSManager) RemoveIPRateLimit(ctx context.Context, ip string) error {
 		// Channel full, will be updated on next monitoring cycle
 	}
 
-	// Delete from database (async)
+	// Clear the limit in database (async) - set to NULL
 	if s.deviceRepo != nil {
 		go func() {
-			if err := s.deviceRepo.Delete(context.Background(), ip); err != nil {
-				log.Printf("Failed to delete device %s from database: %v", ip, err)
+			bgCtx := context.Background()
+			if err := s.deviceRepo.UpdateLimit(bgCtx, ip, nil); err != nil {
+				log.Printf("Failed to clear limit in database for %s: %v", ip, err)
 			} else {
-				log.Printf("Device %s deleted from database", ip)
+				log.Printf("Limit cleared in database for %s", ip)
 			}
 		}()
 	}
@@ -402,6 +415,69 @@ func (s *QoSManager) monitorLoop(ctx context.Context, detectedIPs map[string]boo
 			if lastMAC, exists := s.lastKnownMAC[ip]; exists && lastMAC != currentMAC {
 				log.Printf("MAC change detected for IP %s: %s -> %s", ip, lastMAC, currentMAC)
 				macChanged = true
+
+				// Check if the old device was blocked
+				var wasBlocked bool
+				if s.deviceRepo != nil {
+					checkCtx := context.Background()
+					oldDevice, err := s.deviceRepo.FindByIP(checkCtx, ip)
+					if err == nil && oldDevice != nil && oldDevice.IsBlocked {
+						wasBlocked = true
+						log.Printf("Old device at %s (MAC: %s) was blocked, unblocking due to MAC change", ip, lastMAC)
+
+						// Unblock the IP since it's a different device now
+						if err := s.driver.UnblockDevice(checkCtx, ip, s.inet); err != nil {
+							log.Printf("Warning: Failed to unblock %s after MAC change: %v", ip, err)
+						}
+					}
+				}
+
+				// Delete old device record from database (different device now)
+				if s.deviceRepo != nil {
+					go func(oldIP, oldMAC string, blocked bool) {
+						bgCtx := context.Background()
+						// Delete by IP since the old MAC+IP combination no longer exists
+						if err := s.deviceRepo.Delete(bgCtx, oldIP); err != nil {
+							log.Printf("Failed to delete old device record for %s (MAC: %s): %v", oldIP, oldMAC, err)
+						} else {
+							if blocked {
+								log.Printf("Deleted old blocked device record for %s (MAC: %s)", oldIP, oldMAC)
+							} else {
+								log.Printf("Deleted old device record for %s (MAC: %s)", oldIP, oldMAC)
+							}
+						}
+					}(ip, lastMAC, wasBlocked)
+				}
+
+				// If this IP had a custom limit, remove it since it's a different device
+				if info, hasLimit := s.activeIPLimits[ip]; hasLimit {
+					log.Printf("Removing custom limit for IP %s due to MAC address change", ip)
+
+					// Remove the tc rule while we have the lock
+					if err := s.driver.RemoveIPRateLimit(ctx, ip, info.Rule); err != nil {
+						log.Printf("Warning: Failed to remove tc rule after MAC change for %s: %v", ip, err)
+					}
+
+					// Remove from active limits
+					delete(s.activeIPLimits, ip)
+
+					// Increment sequence
+					s.incrementSequence()
+
+					// Clear limit in database (async)
+					if s.deviceRepo != nil {
+						go func(oldIP string) {
+							bgCtx := context.Background()
+							if err := s.deviceRepo.UpdateLimit(bgCtx, oldIP, nil); err != nil {
+								log.Printf("Failed to clear limit in database for %s: %v", oldIP, err)
+							} else {
+								log.Printf("Limit cleared in database for %s", oldIP)
+							}
+						}(ip)
+					}
+
+					log.Printf("IP %s limit removed due to MAC change", ip)
+				}
 			}
 		}
 
@@ -411,9 +487,21 @@ func (s *QoSManager) monitorLoop(ctx context.Context, detectedIPs map[string]boo
 		}
 		s.ipMutex.Unlock()
 
-		// Check device tracking only for new IPs or MAC changes
-		if isNewIP || macChanged {
-			s.trackDeviceOnConnect(ctx, ip, now)
+		// Update database for new IPs or MAC changes
+		if (isNewIP || macChanged) && s.deviceRepo != nil && currentMAC != "" {
+			go func(ip, mac string) {
+				bgCtx := context.Background()
+				device := &domain.Device{
+					IP:         ip,
+					MACAddress: mac,
+					// No limit initially - will be set when user applies one
+				}
+				if err := s.deviceRepo.Upsert(bgCtx, device); err != nil {
+					log.Printf("Failed to upsert device %s (MAC: %s) to database: %v", ip, mac, err)
+				} else {
+					log.Printf("Device %s (MAC: %s) saved to database", ip, mac)
+				}
+			}(ip, currentMAC)
 		}
 
 		detectedIPs[ip] = true // Marquer comme détecté lors de ce cycle
@@ -602,16 +690,26 @@ func (s *QoSManager) sendGlobalStats(ctx context.Context) *domain.GlobalTrafficS
 	}
 
 	// Compter les IPs actives et limitées
+	// totalActive = nombre total d'IPs avec trafic détecté (détectées via iptables)
+	// totalLimited = nombre d'IPs avec limite personnalisée appliquée par l'utilisateur
 	s.ipMutex.RLock()
-	totalActive := len(s.activeIPLimits)
+	totalActive := len(s.detectedIPs) // Nombre total d'IPs détectées avec trafic
+	s.ipMutex.RUnlock()
+
+	// Count IPs with user-applied limits from database
 	totalLimited := 0
-	for _, info := range s.activeIPLimits {
-		// Si la bande passante n'est pas la valeur par défaut, on la considère comme limitée
-		if info.Rule.Bandwidth != DefaultIPRate {
-			totalLimited++
+	if s.deviceRepo != nil {
+		ctx := context.Background()
+		devices, err := s.deviceRepo.ListAll(ctx)
+		if err == nil {
+			for _, device := range devices {
+				// Count devices with non-null bandwidth_limit
+				if device.BandwidthLimit != nil && *device.BandwidthLimit != "" {
+					totalLimited++
+				}
+			}
 		}
 	}
-	s.ipMutex.RUnlock()
 
 	s.globalSetupMutex.Lock()
 	currentGlobalLimit := s.globalLimit
@@ -620,10 +718,10 @@ func (s *QoSManager) sendGlobalStats(ctx context.Context) *domain.GlobalTrafficS
 	globalStat := domain.GlobalTrafficStat{
 		LanInterface:    s.ilan,
 		WanInterface:    s.inet,
-		LanUploadRate:   lanTxRate,
-		LanDownloadRate: lanRxRate,
-		WanUploadRate:   wanTxRate,
-		WanDownloadRate: wanRxRate,
+		LanUploadRate:   lanRxRate, // LAN Rx = Upload from users
+		LanDownloadRate: lanTxRate, // LAN Tx = Download to users
+		WanUploadRate:   wanTxRate, // WAN Tx = Upload to internet
+		WanDownloadRate: wanRxRate, // WAN Rx = Download from internet
 		TotalActiveIPs:  totalActive,
 		TotalLimitedIPs: totalLimited,
 		GlobalLimit:     currentGlobalLimit,
@@ -651,18 +749,72 @@ func (s *QoSManager) sendGlobalStats(ctx context.Context) *domain.GlobalTrafficS
 // BlockDevice bloque un appareil en utilisant iptables pour empêcher l'accès à Internet
 func (s *QoSManager) BlockDevice(ctx context.Context, ip string) error {
 	log.Printf("QoSManager: Blocking device %s", ip)
-	return s.driver.BlockDevice(ctx, ip, s.inet)
+
+	// Apply iptables block
+	if err := s.driver.BlockDevice(ctx, ip, s.inet); err != nil {
+		return err
+	}
+
+	// Persist blocked status to database
+	if err := s.deviceRepo.UpdateBlockedStatus(ctx, ip, true); err != nil {
+		log.Printf("Warning: Failed to persist blocked status for %s: %v", ip, err)
+		// Don't fail the operation if DB update fails, iptables rule is already applied
+	}
+
+	return nil
 }
 
 // UnblockDevice débloque un appareil en supprimant les règles iptables
 func (s *QoSManager) UnblockDevice(ctx context.Context, ip string) error {
 	log.Printf("QoSManager: Unblocking device %s", ip)
-	return s.driver.UnblockDevice(ctx, ip, s.inet)
+
+	// Remove iptables block
+	if err := s.driver.UnblockDevice(ctx, ip, s.inet); err != nil {
+		return err
+	}
+
+	// Persist unblocked status to database
+	if err := s.deviceRepo.UpdateBlockedStatus(ctx, ip, false); err != nil {
+		log.Printf("Warning: Failed to persist unblocked status for %s: %v", ip, err)
+		// Don't fail the operation if DB update fails, iptables rule is already removed
+	}
+
+	return nil
 }
 
 // IsDeviceBlocked vérifie si un appareil est actuellement bloqué
 func (s *QoSManager) IsDeviceBlocked(ctx context.Context, ip string) (bool, error) {
 	return s.driver.IsDeviceBlocked(ctx, ip, s.inet)
+}
+
+// RestoreBlockedDevices restores blocked status from database on startup
+func (s *QoSManager) RestoreBlockedDevices(ctx context.Context) error {
+	log.Println("QoSManager: Restoring blocked devices from database...")
+
+	blockedDevices, err := s.deviceRepo.ListBlocked(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list blocked devices: %w", err)
+	}
+
+	if len(blockedDevices) == 0 {
+		log.Println("QoSManager: No blocked devices to restore")
+		return nil
+	}
+
+	restored := 0
+	failed := 0
+	for _, device := range blockedDevices {
+		if err := s.driver.BlockDevice(ctx, device.IP, s.inet); err != nil {
+			log.Printf("Warning: Failed to restore block for device %s (%s): %v", device.IP, device.MACAddress, err)
+			failed++
+		} else {
+			log.Printf("Restored block for device %s (%s)", device.IP, device.MACAddress)
+			restored++
+		}
+	}
+
+	log.Printf("QoSManager: Restored %d blocked devices (%d failed)", restored, failed)
+	return nil
 }
 
 // GetLanInterface returns the LAN interface name
@@ -673,6 +825,13 @@ func (s *QoSManager) GetLanInterface() string {
 // GetWanInterface returns the WAN interface name
 func (s *QoSManager) GetWanInterface() string {
 	return s.inet
+}
+
+// GetGlobalRateLimit returns the current global bandwidth limit
+func (s *QoSManager) GetGlobalRateLimit() string {
+	s.globalSetupMutex.Lock()
+	defer s.globalSetupMutex.Unlock()
+	return s.globalLimit
 }
 
 // incrementSequence atomically increments the state sequence counter
@@ -691,9 +850,10 @@ func (s *QoSManager) getSequence() uint64 {
 
 // IPSnapshot represents the current state of tracked IPs for sync
 type IPSnapshot struct {
-	Sequence  uint64                 `json:"sequence"`
-	Timestamp time.Time              `json:"timestamp"`
-	IPs       []domain.IPTrafficStat `json:"ips"`
+	Sequence    uint64                 `json:"sequence"`
+	Timestamp   time.Time              `json:"timestamp"`
+	GlobalLimit string                 `json:"global_limit"`
+	IPs         []domain.IPTrafficStat `json:"ips"`
 }
 
 // CurrentIPSnapshot returns the current state of all tracked IPs with sequence number
@@ -716,9 +876,10 @@ func (s *QoSManager) CurrentIPSnapshot() IPSnapshot {
 	}
 
 	return IPSnapshot{
-		Sequence:  s.getSequence(),
-		Timestamp: time.Now(),
-		IPs:       ips,
+		Sequence:    s.getSequence(),
+		Timestamp:   time.Now(),
+		GlobalLimit: s.globalLimit,
+		IPs:         ips,
 	}
 }
 

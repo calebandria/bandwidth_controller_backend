@@ -15,6 +15,7 @@ func RegisterScheduleRoutes(r *gin.Engine, scheduler *service.BandwidthScheduler
 		api.GET("/global", GetGlobalScheduleHandler(scheduler))
 		api.POST("/global", SetGlobalScheduleHandler(scheduler))
 		api.POST("/global/rule", AddScheduleRuleHandler(scheduler))
+		api.PUT("/global/rule/:id", UpdateScheduleRuleHandler(scheduler))
 		api.DELETE("/global/:id", DeleteScheduleRuleHandler(scheduler))
 		api.GET("/global/:id/next", GetNextScheduleHandler(scheduler))
 	}
@@ -121,6 +122,60 @@ func AddScheduleRuleHandler(scheduler *service.BandwidthScheduler) gin.HandlerFu
 		c.JSON(http.StatusOK, gin.H{
 			"status":  "success",
 			"message": "Rule added successfully",
+			"rule_id": rule.ID,
+		})
+	}
+}
+
+// UpdateScheduleRuleHandler updates an existing schedule rule
+// @Summary Update a schedule rule
+// @Description Modifie une règle de scheduling existante
+// @Tags Schedule
+// @Accept json
+// @Produce json
+// @Param id path string true "Rule ID"
+// @Param rule body domain.ScheduleRule true "Updated schedule rule"
+// @Success 200 {object} map[string]interface{}
+// @Failure 400 {object} map[string]string
+// @Router /qos/schedule/global/rule/{id} [put]
+func UpdateScheduleRuleHandler(scheduler *service.BandwidthScheduler) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		id := c.Param("id")
+		if id == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Rule ID is required in path"})
+			return
+		}
+
+		var rule domain.ScheduleRule
+		if err := c.ShouldBindJSON(&rule); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request format", "details": err.Error()})
+			return
+		}
+
+		// Ensure ID matches path parameter
+		if rule.ID != id {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Rule ID in body must match path parameter"})
+			return
+		}
+
+		// Valider la règle
+		if rule.CronExpr == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Cron expression is required"})
+			return
+		}
+		if rule.RateMbps <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Rate must be positive"})
+			return
+		}
+
+		if err := scheduler.UpdateRule(rule); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to update rule", "details": err.Error()})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"status":  "success",
+			"message": "Rule updated successfully",
 			"rule_id": rule.ID,
 		})
 	}

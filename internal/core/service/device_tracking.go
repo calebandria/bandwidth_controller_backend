@@ -56,7 +56,7 @@ func (s *QoSManager) trackDeviceOnConnect(ctx context.Context, ip string, now ti
 			// MAC address changed - different device using same IP
 			log.Printf("IP %s MAC changed: %s -> %s. Different device detected, clearing limit.", ip, device.MACAddress, mac)
 
-			// CRITICAL: Remove the active tc limit for this IP
+			// Remove the active tc limit for this IP
 			if err := s.RemoveIPRateLimit(ctx, ip); err != nil {
 				log.Printf("Warning: Failed to remove active limit for IP %s: %v", ip, err)
 				// Continue anyway - we still want to update the database

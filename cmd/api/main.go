@@ -103,16 +103,22 @@ func main() {
 	} else {
 		log.Println("Automatic HTB startup success")
 
-		// ⚠️ ADD THIS DELAY: Give the Linux kernel a moment to commit the complex TC rules.
+		// Give the kernel time to commit TC rules
 		log.Println("Waiting 100ms for system commit...")
 		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Restore blocked devices from database
+	if err := qosService.RestoreBlockedDevices(cleanupCtx); err != nil {
+		log.Printf("Warning: Failed to restore blocked devices: %v", err)
 	}
 
 	// UTILISATION DE 'go' POUR EXÉCUTER LA BOUCLE DE MONITORING EN PARALLÈLE
 	go qosService.StartIPMonitoring(ctx, 2*time.Second) // Lance le monitoring toutes les 2 secondes
 
-	// 6. Initialize Scheduler
-	bandwidthScheduler := service.NewBandwidthScheduler(qosService)
+	// 6. Initialize Schedule Repository and Scheduler
+	scheduleRepo := adapter.NewPostgresScheduleRepository(db)
+	bandwidthScheduler := service.NewBandwidthScheduler(qosService, scheduleRepo)
 	bandwidthScheduler.Start()
 	log.Println("Bandwidth scheduler initialized")
 	// 7. Initialize Auth Handler

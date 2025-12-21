@@ -19,6 +19,12 @@ type DeviceRepository interface {
 	// UpdateLimit updates the bandwidth limit for a device
 	UpdateLimit(ctx context.Context, ip string, limit *string) error
 
+	// UpdateBlockedStatus updates the blocked status for a device
+	UpdateBlockedStatus(ctx context.Context, ip string, isBlocked bool) error
+
+	// ListBlocked returns all blocked devices
+	ListBlocked(ctx context.Context) ([]domain.Device, error)
+
 	// UpdateLastSeen updates the last_seen timestamp
 	UpdateLastSeen(ctx context.Context, ip string) error
 

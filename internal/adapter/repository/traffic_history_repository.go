@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -104,12 +105,24 @@ func (r *PostgresTrafficHistoryRepository) SaveIPTraffic(ctx context.Context, en
 
 // GetGlobalTrafficHistory retrieves global traffic history for a time range
 func (r *PostgresTrafficHistoryRepository) GetGlobalTrafficHistory(ctx context.Context, startTime, endTime time.Time, interval string) ([]*domain.TrafficHistoryEntry, error) {
-	// Parse interval for aggregation (e.g., "5m" -> 5 minutes)
+	// Parse interval for aggregation (e.g., "5 minute" -> "minute")
 	var query string
 	var rows *sql.Rows
 	var err error
 
 	if interval != "" && interval != "raw" {
+		// Extract the time unit from interval (e.g., "5 minute" -> "minute", "1 hour" -> "hour")
+		truncUnit := interval
+		if len(interval) > 2 && interval[1] == ' ' {
+			// Format: "5 minute", "1 hour", etc. - extract the unit
+			parts := strings.Fields(interval)
+			if len(parts) == 2 {
+				truncUnit = parts[1] // Get the time unit (minute, hour, day)
+				// Remove trailing 's' if present (e.g., "minutes" -> "minute")
+				truncUnit = strings.TrimSuffix(truncUnit, "s")
+			}
+		}
+
 		// Aggregate data by time buckets
 		query = `
 			SELECT 
@@ -123,7 +136,7 @@ func (r *PostgresTrafficHistoryRepository) GetGlobalTrafficHistory(ctx context.C
 			GROUP BY date_trunc($1, timestamp)
 			ORDER BY timestamp ASC
 		`
-		rows, err = r.db.QueryContext(ctx, query, interval, startTime, endTime)
+		rows, err = r.db.QueryContext(ctx, query, truncUnit, startTime, endTime)
 	} else {
 		// Return raw data
 		query = `
@@ -232,16 +245,21 @@ func (r *PostgresTrafficHistoryRepository) GetTopConsumers(ctx context.Context, 
 		WITH traffic_totals AS (
 			SELECT 
 				ip,
-				mac_address,
-				hostname,
+				-- Get the most recent MAC and hostname for this IP
+				(SELECT mac_address FROM ip_traffic_history t2 
+				 WHERE t2.ip = t1.ip AND t2.timestamp >= $1 AND t2.timestamp <= $2 
+				 ORDER BY timestamp DESC LIMIT 1) as mac_address,
+				(SELECT hostname FROM ip_traffic_history t2 
+				 WHERE t2.ip = t1.ip AND t2.timestamp >= $1 AND t2.timestamp <= $2 
+				 ORDER BY timestamp DESC LIMIT 1) as hostname,
 				-- Calculate total MB by integrating rate over time (assuming 2-second intervals)
 				SUM(upload_rate * 2 / 8) as total_upload_mb,      -- Mbps * seconds / 8 = MB
 				SUM(download_rate * 2 / 8) as total_download_mb,
 				AVG(upload_rate) as avg_upload_rate,
 				AVG(download_rate) as avg_download_rate
-			FROM ip_traffic_history
+			FROM ip_traffic_history t1
 			WHERE timestamp >= $1 AND timestamp <= $2
-			GROUP BY ip, mac_address, hostname
+			GROUP BY ip
 		)
 		SELECT 
 			ip,

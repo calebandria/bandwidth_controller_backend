@@ -45,10 +45,10 @@ type IPTrafficStat struct {
 type GlobalTrafficStat struct {
 	LanInterface    string    `json:"lan_interface" example:"wlo1"`
 	WanInterface    string    `json:"wan_interface" example:"eno2"`
-	LanUploadRate   float64   `json:"lan_upload_rate_mbps" example:"15.3"`   // Upload depuis LAN (Tx sur LAN)
-	LanDownloadRate float64   `json:"lan_download_rate_mbps" example:"45.8"` // Download vers LAN (Rx sur LAN)
-	WanUploadRate   float64   `json:"wan_upload_rate_mbps" example:"15.2"`   // Upload vers WAN (Tx sur WAN)
-	WanDownloadRate float64   `json:"wan_download_rate_mbps" example:"45.9"` // Download depuis WAN (Rx sur WAN)
+	LanUploadRate   float64   `json:"lan_upload_rate_mbps" example:"15.3"`   // Upload from users (LAN Rx)
+	LanDownloadRate float64   `json:"lan_download_rate_mbps" example:"45.8"` // Download to users (LAN Tx)
+	WanUploadRate   float64   `json:"wan_upload_rate_mbps" example:"15.2"`   // Upload to internet (WAN Tx)
+	WanDownloadRate float64   `json:"wan_download_rate_mbps" example:"45.9"` // Download from internet (WAN Rx)
 	TotalActiveIPs  int       `json:"total_active_ips" example:"5"`
 	TotalLimitedIPs int       `json:"total_limited_ips" example:"3"`
 	GlobalLimit     string    `json:"global_limit" example:"100mbit"` // Current global bandwidth limit

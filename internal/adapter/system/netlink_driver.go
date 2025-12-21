@@ -220,15 +220,12 @@ func (l *LinuxDriver) ResetShaping(ctx context.Context, ilan string, iwan string
 		if err != nil {
 			outputStr := string(output)
 
-			// --- CRITICAL FIX START ---
-			// 1. Check for the specific error when no qdisc exists (your observed error)
-			// 2. The generic "Cannot delete specified qdisc" error is also returned when the handle is missing.
+			// Check for the specific error when no qdisc exists
 			if strings.Contains(outputStr, "Cannot delete qdisc with handle of zero") ||
 				strings.Contains(outputStr, "Cannot delete specified qdisc") {
 				log.Printf("INFO: No root qdisc found on %s, treating as successful reset.", iface)
 				return nil // Treat "no qdisc exists" as a success (idempotency)
 			}
-			// --- CRITICAL FIX END ---
 
 			// The previously checked (but less specific) errors:
 			if strings.Contains(outputStr, "No such file or directory") || strings.Contains(outputStr, "Invalid argument") {
