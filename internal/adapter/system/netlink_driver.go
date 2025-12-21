@@ -938,3 +938,80 @@ func (l *LinuxDriver) IsDeviceBlocked(ctx context.Context, ip string, wanInterfa
 
 	return false, nil
 }
+
+// GetMACFromIP resolves MAC address for an IP using ARP cache
+func (l *LinuxDriver) GetMACFromIP(ctx context.Context, ip string) (string, error) {
+	// Try reading from /proc/net/arp first (faster)
+	data, err := os.ReadFile("/proc/net/arp")
+	if err == nil {
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines {
+			fields := strings.Fields(line)
+			// Format: IP address  HW type  Flags  HW address  Mask  Device
+			if len(fields) >= 4 && fields[0] == ip {
+				mac := fields[3]
+				// Validate MAC format (not incomplete entry)
+				if mac != "00:00:00:00:00:00" && strings.Contains(mac, ":") {
+					return strings.ToUpper(mac), nil
+				}
+			}
+		}
+	}
+
+	// Fallback: use 'ip neigh' command
+	cmd := exec.CommandContext(ctx, "ip", "neigh", "show", ip)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("failed to lookup MAC for IP %s: %w", ip, err)
+	}
+
+	// Parse output: "192.168.1.10 dev wlo1 lladdr aa:bb:cc:dd:ee:ff REACHABLE"
+	outputStr := strings.TrimSpace(string(output))
+	if outputStr == "" {
+		return "", fmt.Errorf("no ARP entry found for IP %s", ip)
+	}
+
+	fields := strings.Fields(outputStr)
+	for i, field := range fields {
+		if field == "lladdr" && i+1 < len(fields) {
+			mac := fields[i+1]
+			return strings.ToUpper(mac), nil
+		}
+	}
+
+	return "", fmt.Errorf("could not parse MAC address from ARP cache for IP %s", ip)
+}
+
+// GetHostnameFromIP resolves hostname for an IP using reverse DNS lookup
+func (l *LinuxDriver) GetHostnameFromIP(ctx context.Context, ip string) (string, error) {
+	// Try using 'host' command for reverse DNS lookup
+	cmd := exec.CommandContext(ctx, "host", ip)
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		// Parse output: "10.0.0.5.in-addr.arpa domain name pointer johns-laptop.local."
+		outputStr := strings.TrimSpace(string(output))
+		if strings.Contains(outputStr, "domain name pointer") {
+			parts := strings.Split(outputStr, "domain name pointer")
+			if len(parts) >= 2 {
+				hostname := strings.TrimSpace(parts[1])
+				// Remove trailing dot if present
+				hostname = strings.TrimSuffix(hostname, ".")
+				return hostname, nil
+			}
+		}
+	}
+
+	// Fallback: try using 'getent hosts' (checks /etc/hosts and DNS)
+	cmd = exec.CommandContext(ctx, "getent", "hosts", ip)
+	output, err = cmd.CombinedOutput()
+	if err == nil {
+		// Parse output: "192.168.1.10    johns-laptop"
+		fields := strings.Fields(string(output))
+		if len(fields) >= 2 {
+			return fields[1], nil
+		}
+	}
+
+	// No hostname found
+	return "", fmt.Errorf("no hostname found for IP %s", ip)
+}

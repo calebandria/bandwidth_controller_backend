@@ -31,6 +31,7 @@ type IPTrackingInfo struct {
 
 type QoSManager struct {
 	driver           port.NetworkDriver
+	deviceRepo       port.DeviceRepository
 	statsStream      chan domain.TrafficUpdate // Canal pour envoyer les statistiques IP et globales
 	threshold        uint64
 	ilan             string
@@ -43,12 +44,19 @@ type QoSManager struct {
 	activeIPLimits map[string]IPTrackingInfo
 	// Suivi de toutes les IPs détectées (même sans limite explicite)
 	detectedIPs map[string]time.Time // IP -> LastSeenAt
-	ipMutex     sync.RWMutex
+	// Track last known MAC for each IP to detect MAC changes
+	lastKnownMAC map[string]string // IP -> MAC
+	ipMutex      sync.RWMutex
+
+	// Sequence counter for state synchronization
+	stateSequence uint64
+	sequenceMutex sync.Mutex
 }
 
-func NewQoSManager(driver port.NetworkDriver, ilan string, inet string) *QoSManager {
+func NewQoSManager(driver port.NetworkDriver, deviceRepo port.DeviceRepository, ilan string, inet string) *QoSManager {
 	mgr := &QoSManager{
 		driver:         driver,
+		deviceRepo:     deviceRepo,
 		statsStream:    make(chan domain.TrafficUpdate, 100),
 		threshold:      100000000,
 		ilan:           ilan,
@@ -57,6 +65,8 @@ func NewQoSManager(driver port.NetworkDriver, ilan string, inet string) *QoSMana
 		globalLimit:    "0", // Will be set during SetupGlobalQoS
 		activeIPLimits: make(map[string]IPTrackingInfo),
 		detectedIPs:    make(map[string]time.Time),
+		lastKnownMAC:   make(map[string]string),
+		stateSequence:  0,
 	}
 	return mgr
 }
@@ -189,6 +199,38 @@ func (s *QoSManager) AddIPRateLimit(ctx context.Context, ip string, rule domain.
 		// ClassID sera déduit/récupéré par le moniteur.
 	}
 
+	// Increment sequence on state change
+	s.incrementSequence()
+
+	// Immediately broadcast the change to WebSocket clients
+	s.ipMutex.RLock()
+	mac := s.lastKnownMAC[ip]
+	s.ipMutex.RUnlock()
+
+	ipStat := domain.IPTrafficStat{
+		IP:             ip,
+		MACAddress:     mac,
+		UploadRate:     0,
+		DownloadRate:   0,
+		IsLimited:      true,
+		BandwidthLimit: rule.Bandwidth,
+		Status:         "Active",
+	}
+	update := domain.TrafficUpdate{
+		Type:   "ip",
+		IPStat: &ipStat,
+	}
+	select {
+	case s.statsStream <- update:
+		// Sent successfully
+	default:
+		// Channel full, will be updated on next monitoring cycle
+	}
+
+	// Persist to database (async to avoid blocking)
+	// Use background context to prevent cancellation when HTTP request finishes
+	go s.persistIPLimit(context.Background(), ip, rule.Bandwidth)
+
 	log.Printf("IP %s successfully added to rate limits.", ip)
 	return nil
 }
@@ -209,6 +251,46 @@ func (s *QoSManager) RemoveIPRateLimit(ctx context.Context, ip string) error {
 	}
 
 	delete(s.activeIPLimits, ip)
+
+	// Increment sequence on state change
+	s.incrementSequence()
+
+	// Immediately broadcast the change to WebSocket clients
+	s.ipMutex.RLock()
+	mac := s.lastKnownMAC[ip]
+	s.ipMutex.RUnlock()
+
+	ipStat := domain.IPTrafficStat{
+		IP:             ip,
+		MACAddress:     mac,
+		UploadRate:     0,
+		DownloadRate:   0,
+		IsLimited:      false,
+		BandwidthLimit: "", // Empty = global limit
+		Status:         "Active",
+	}
+	update := domain.TrafficUpdate{
+		Type:   "ip",
+		IPStat: &ipStat,
+	}
+	select {
+	case s.statsStream <- update:
+		// Sent successfully
+	default:
+		// Channel full, will be updated on next monitoring cycle
+	}
+
+	// Delete from database (async)
+	if s.deviceRepo != nil {
+		go func() {
+			if err := s.deviceRepo.Delete(context.Background(), ip); err != nil {
+				log.Printf("Failed to delete device %s from database: %v", ip, err)
+			} else {
+				log.Printf("Device %s deleted from database", ip)
+			}
+		}()
+	}
+
 	log.Printf("IP %s successfully removed from rate limits.", ip)
 	return nil
 }
@@ -288,20 +370,50 @@ func (s *QoSManager) monitorLoop(ctx context.Context, detectedIPs map[string]boo
 	}
 	s.ipMutex.RUnlock()
 
-	// --- Traiter les nouvelles IPs ---
+	// --- Traiter les nouvelles IPs et vérifier les changements de MAC ---
 	for _, ip := range connectedIPs {
+		// Get current MAC address
+		var currentMAC string
+		if macDriver, ok := s.driver.(interface {
+			GetMACFromIP(context.Context, string) (string, error)
+		}); ok {
+			if mac, err := macDriver.GetMACFromIP(ctx, ip); err == nil {
+				currentMAC = mac
+			}
+		}
+
 		s.ipMutex.Lock()
+		isNewIP := false
+		macChanged := false
+
 		if _, exists := s.detectedIPs[ip]; !exists {
-			// Nouvelle IP détectée - on la track sans créer de classe HTB
+			// Nouvelle IP détectée
 			log.Printf("New IP detected: %s. Tracking under global limit only (no per-IP class).", ip)
+			isNewIP = true
 
 			// Créer des règles iptables de comptage pour pouvoir lire les stats
 			if err := s.driver.EnsureIPCountingRules(ctx, ip, s.ilan, s.inet); err != nil {
 				log.Printf("Warning: Failed to create counting rules for IP %s: %v", ip, err)
 			}
+		} else if currentMAC != "" {
+			// IP exists - check if MAC changed
+			if lastMAC, exists := s.lastKnownMAC[ip]; exists && lastMAC != currentMAC {
+				log.Printf("MAC change detected for IP %s: %s -> %s", ip, lastMAC, currentMAC)
+				macChanged = true
+			}
 		}
+
 		s.detectedIPs[ip] = now // Mettre à jour LastSeenAt
+		if currentMAC != "" {
+			s.lastKnownMAC[ip] = currentMAC // Track current MAC
+		}
 		s.ipMutex.Unlock()
+
+		// Check device tracking only for new IPs or MAC changes
+		if isNewIP || macChanged {
+			s.trackDeviceOnConnect(ctx, ip, now)
+		}
+
 		detectedIPs[ip] = true // Marquer comme détecté lors de ce cycle
 	}
 
@@ -390,8 +502,25 @@ func (s *QoSManager) monitorLoop(ctx context.Context, detectedIPs map[string]boo
 			bandwidthLimit = "" // Vide = sous limite globale
 		}
 
+		// Get MAC address and hostname for this IP
+		var macAddress, hostname string
+		s.ipMutex.RLock()
+		macAddress = s.lastKnownMAC[ip]
+		s.ipMutex.RUnlock()
+
+		// Try to get hostname from reverse DNS (non-blocking)
+		if macDriver, ok := s.driver.(interface {
+			GetHostnameFromIP(context.Context, string) (string, error)
+		}); ok {
+			if host, err := macDriver.GetHostnameFromIP(ctx, ip); err == nil && host != "" {
+				hostname = host
+			}
+		}
+
 		ipStat := domain.IPTrafficStat{
 			IP:             ip,
+			MACAddress:     macAddress,
+			Hostname:       hostname,
 			UploadRate:     uploadRateMbps,
 			DownloadRate:   downloadRateMbps,
 			IsLimited:      isLimited,
@@ -522,6 +651,53 @@ func (s *QoSManager) GetLanInterface() string {
 // GetWanInterface returns the WAN interface name
 func (s *QoSManager) GetWanInterface() string {
 	return s.inet
+}
+
+// incrementSequence atomically increments the state sequence counter
+func (s *QoSManager) incrementSequence() {
+	s.sequenceMutex.Lock()
+	s.stateSequence++
+	s.sequenceMutex.Unlock()
+}
+
+// getSequence returns the current sequence number
+func (s *QoSManager) getSequence() uint64 {
+	s.sequenceMutex.Lock()
+	defer s.sequenceMutex.Unlock()
+	return s.stateSequence
+}
+
+// IPSnapshot represents the current state of tracked IPs for sync
+type IPSnapshot struct {
+	Sequence  uint64                 `json:"sequence"`
+	Timestamp time.Time              `json:"timestamp"`
+	IPs       []domain.IPTrafficStat `json:"ips"`
+}
+
+// CurrentIPSnapshot returns the current state of all tracked IPs with sequence number
+func (s *QoSManager) CurrentIPSnapshot() IPSnapshot {
+	s.ipMutex.RLock()
+	defer s.ipMutex.RUnlock()
+
+	ips := make([]domain.IPTrafficStat, 0, len(s.activeIPLimits))
+	for ip, info := range s.activeIPLimits {
+		// Get current stats for this IP
+		ipStat := domain.IPTrafficStat{
+			IP:             ip,
+			UploadRate:     0.0, // Will be updated by monitoring loop
+			DownloadRate:   0.0,
+			IsLimited:      info.Rule.Bandwidth != DefaultIPRate,
+			BandwidthLimit: info.Rule.Bandwidth,
+			Status:         "Active",
+		}
+		ips = append(ips, ipStat)
+	}
+
+	return IPSnapshot{
+		Sequence:  s.getSequence(),
+		Timestamp: time.Now(),
+		IPs:       ips,
+	}
 }
 
 /* func() */

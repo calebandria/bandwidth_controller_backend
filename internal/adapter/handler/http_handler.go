@@ -11,6 +11,7 @@ import (
 
 	"bandwidth_controller_backend/internal/core/domain"
 	"bandwidth_controller_backend/internal/core/port"
+	service "bandwidth_controller_backend/internal/core/service"
 )
 
 // --- Request Structs ---
@@ -347,6 +348,23 @@ func (h *NetworkHandler) StreamTrafficStatsHandler(c *gin.Context) {
 	}
 	defer conn.Close()
 
+	// Send initial snapshot immediately on connect
+	qosManager, ok := h.svc.(interface {
+		CurrentIPSnapshot() service.IPSnapshot
+	})
+	if ok {
+		snapshot := qosManager.CurrentIPSnapshot()
+		snapshotMsg := map[string]interface{}{
+			"type":     "snapshot",
+			"snapshot": snapshot,
+		}
+		if err := conn.WriteJSON(snapshotMsg); err != nil {
+			log.Printf("Error sending initial snapshot: %v", err)
+			return
+		}
+		log.Println("Initial snapshot sent to WebSocket client")
+	}
+
 	// Le service expose un canal de statistiques (IP et globales)
 	statsStream := h.svc.GetStatsStream()
 
@@ -383,6 +401,27 @@ func (h *NetworkHandler) StreamTrafficStatsHandler(c *gin.Context) {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
+}
+
+// GetIPsSnapshotHandler
+// @Summary Returns the current snapshot of all tracked IPs with sequence number
+// @Description Returns a snapshot of IP state for persistence and synchronization. Includes sequence number and timestamp.
+// @Tags Monitoring
+// @Produce json
+// @Success 200 {object} map[string]interface{} "snapshot with sequence, timestamp, and ips array"
+// @Failure 500 {object} map[string]string "error: Failed to retrieve snapshot"
+// @Router /qos/ips [get]
+func (h *NetworkHandler) GetIPsSnapshotHandler(c *gin.Context) {
+	qosManager, ok := h.svc.(interface {
+		CurrentIPSnapshot() service.IPSnapshot
+	})
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Snapshot not supported"})
+		return
+	}
+
+	snapshot := qosManager.CurrentIPSnapshot()
+	c.JSON(http.StatusOK, snapshot)
 }
 
 // ScheduleGlobalLimitHandler

@@ -33,11 +33,13 @@ type TrafficState struct {
 
 type IPTrafficStat struct {
 	IP             string  `json:"ip" example:"192.168.1.10"`
-	UploadRate     float64 `json:"upload_rate_mbps" example:"5.2"`    // Taux d'upload instantané en Mbps
-	DownloadRate   float64 `json:"download_rate_mbps" example:"10.8"` // Taux de download instantané en Mbps
-	IsLimited      bool    `json:"is_limited"`                        // Indique si une règle personnalisée est appliquée (au-delà du défaut)
-	BandwidthLimit string  `json:"bandwidth_limit" example:"25mbit"`  // Limite de bande passante appliquée (e.g., "25mbit", "100mbit")
-	Status         string  `json:"status"`                            // Ex: "Active", "Disconnected"
+	MACAddress     string  `json:"mac_address,omitempty" example:"AA:BB:CC:DD:EE:FF"` // MAC address of the device
+	Hostname       string  `json:"hostname,omitempty" example:"johns-laptop"`         // Device hostname if available
+	UploadRate     float64 `json:"upload_rate_mbps" example:"5.2"`                    // Taux d'upload instantané en Mbps
+	DownloadRate   float64 `json:"download_rate_mbps" example:"10.8"`                 // Taux de download instantané en Mbps
+	IsLimited      bool    `json:"is_limited"`                                        // Indique si une règle personnalisée est appliquée (au-delà du défaut)
+	BandwidthLimit string  `json:"bandwidth_limit" example:"25mbit"`                  // Limite de bande passante appliquée (e.g., "25mbit", "100mbit")
+	Status         string  `json:"status"`                                            // Ex: "Active", "Disconnected"
 }
 
 type GlobalTrafficStat struct {

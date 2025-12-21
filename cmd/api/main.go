@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 	adapter "bandwidth_controller_backend/internal/adapter/repository"
 	"bandwidth_controller_backend/internal/adapter/system"
 	"bandwidth_controller_backend/internal/config"
+	"bandwidth_controller_backend/internal/core/port"
 	"bandwidth_controller_backend/internal/core/service"
 )
 
@@ -57,7 +59,36 @@ func main() {
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cleanupCancel()
 
-	qosService := service.NewQoSManager(networkDriver, lanInterface, wanInterface)
+	// 3. Clean up interfaces before setup
+	log.Printf("Cleaning up interface %s and %s on startup...", wanInterface, lanInterface)
+	if err := networkDriver.ResetShaping(cleanupCtx, lanInterface, wanInterface); err != nil {
+		log.Printf("Warning: Could not clean up existing QoS rules (may be normal if none exist): %v", err)
+	} else {
+		log.Println("Interface cleaned successfully.")
+	}
+
+	// 4. Initialize Database Connection FIRST
+	dbConfig := config.GetDatabaseConfig()
+	db, err := config.ConnectDatabase(dbConfig)
+
+	// Initialize device repository
+	var deviceRepo port.DeviceRepository
+	if err != nil {
+		log.Printf("Warning: Could not connect to PostgreSQL: %v", err)
+		log.Println("Device persistence disabled (no database)")
+		deviceRepo = nil // QoSManager will handle nil gracefully
+	} else {
+		log.Println("PostgreSQL connection successful")
+		deviceRepo = adapter.NewPostgresDeviceRepository(db)
+
+		// Run device table migration
+		if err := runDeviceMigration(db); err != nil {
+			log.Printf("Warning: Device migration failed: %v", err)
+		}
+	}
+
+	// 5. Create QoSManager with device repository from the start
+	qosService := service.NewQoSManager(networkDriver, deviceRepo, lanInterface, wanInterface)
 
 	if err := qosService.SetupGlobalQoS(cleanupCtx, lanInterface, wanInterface, globalRateLimit); err != nil {
 		log.Fatalf("Fatal Error: Could not start default global HTB QoS: %v. Exiting.", err)
@@ -72,45 +103,59 @@ func main() {
 	// UTILISATION DE 'go' POUR EXÉCUTER LA BOUCLE DE MONITORING EN PARALLÈLE
 	go qosService.StartIPMonitoring(ctx, 2*time.Second) // Lance le monitoring toutes les 2 secondes
 
-	// Initialiser le Scheduler de bande passante
+	// 6. Initialize Scheduler
 	bandwidthScheduler := service.NewBandwidthScheduler(qosService)
 	bandwidthScheduler.Start()
 	log.Println("Bandwidth scheduler initialized")
-
-	// 3. Clean up interfaces before setup
-	log.Printf("Cleaning up interface %s and %s on startup...", wanInterface, lanInterface)
-	if err := networkDriver.ResetShaping(cleanupCtx, lanInterface, wanInterface); err != nil {
-		log.Printf("Warning: Could not clean up existing QoS rules (may be normal if none exist): %v", err)
-	} else {
-		log.Println("Interface cleaned successfully.")
-	}
-
-	// 4. Initialize Network Handler
-	qosHandler := handler.NewNetworkHandler(qosService, networkDriver, lanInterface, wanInterface)
-
-	// 5. Initialize Database Connection
-	dbConfig := config.GetDatabaseConfig()
-	db, err := config.ConnectDatabase(dbConfig)
-
+	// 7. Initialize Auth Handler
 	var authHandler *handler.AuthHandler
 	if err != nil {
-		log.Printf("Warning: Could not connect to PostgreSQL: %v", err)
 		log.Println("Falling back to in-memory auth repository")
 		authRepo := adapter.NewInMemoryAuthRepository()
 		authService := service.NewAuthService(authRepo)
 		authHandler = handler.NewAuthHandler(authService)
 	} else {
-		log.Println("PostgreSQL connection successful")
 		authRepo := adapter.NewPostgresAuthRepository(db)
 		authService := service.NewAuthService(authRepo)
 		authHandler = handler.NewAuthHandler(authService)
 	}
 
-	// 6. Setup Routes
+	// 8. Initialize Network Handler (AFTER QoSManager has device repo)
+	qosHandler := handler.NewNetworkHandler(qosService, networkDriver, lanInterface, wanInterface)
+
+	// 9. Setup Routes
 	setupRoutes(qosHandler, authHandler, bandwidthScheduler)
 
 	port := "8080"
 	log.Printf("Server listening on port %s...", port)
+}
+
+// runDeviceMigration creates the devices table if it doesn't exist
+func runDeviceMigration(db *sql.DB) error {
+	migrationSQL := `
+	CREATE TABLE IF NOT EXISTS devices (
+		id SERIAL PRIMARY KEY,
+		ip VARCHAR(45) NOT NULL UNIQUE,
+		mac_address VARCHAR(17) NOT NULL,
+		bandwidth_limit VARCHAR(20) DEFAULT NULL,
+		device_name VARCHAR(255) DEFAULT NULL,
+		last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
+	
+	CREATE INDEX IF NOT EXISTS idx_devices_ip ON devices(ip);
+	CREATE INDEX IF NOT EXISTS idx_devices_mac ON devices(mac_address);
+	CREATE INDEX IF NOT EXISTS idx_devices_last_seen ON devices(last_seen);
+	`
+
+	_, err := db.Exec(migrationSQL)
+	if err != nil {
+		return fmt.Errorf("failed to create devices table: %w", err)
+	}
+
+	log.Println("Devices table migration completed")
+	return nil
 }
 
 // setupRoutes configures all HTTP routes
@@ -157,6 +202,7 @@ func setupRoutes(qosHandler *handler.NetworkHandler, authHandler *handler.AuthHa
 	// Routes de Monitoring (WebSocket et HTTP)
 	protected.GET("/qos/stats", qosHandler.GetTrafficStatsHandler)
 	protected.GET("/qos/stream", qosHandler.StreamTrafficStatsHandler)
+	protected.GET("/qos/ips", qosHandler.GetIPsSnapshotHandler)
 	protected.GET("/status/lanips", qosHandler.GetConnectedLANIPsHandler)
 	log.Println("Monitoring routes initialized")
 
